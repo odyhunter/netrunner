@@ -1,8 +1,9 @@
-(ns game-test.engine.rules
+(ns game.engine.rules-test
   (:require [game.core :as core]
-            [game-test.core :refer :all]
-            [game-test.utils :refer :all]
-            [game-test.macros :refer :all]
+            [game.core.card :refer :all]
+            [game.core-test :refer :all]
+            [game.utils-test :refer :all]
+            [game.macros-test :refer :all]
             [clojure.test :refer :all]))
 
 (deftest corp-rez-unique
@@ -309,6 +310,7 @@
     (click-prompt state :runner "No action") ; Dismiss trash prompt
     (is (last-log-contains? state "PAD Campaign") "Accessed card name was logged")
     (run-empty-server state :rd)
+    (click-prompt state :runner "No action")
     (is (last-log-contains? state "an unseen card") "Accessed card name was not logged")
     (run-empty-server state :remote1)
     (click-prompt state :runner "No action") ; Dismiss trash prompt
@@ -350,6 +352,7 @@
     (let [caprice (get-content state :remote1 0)]
       (core/rez state :corp caprice)
       (run-on state "Server 1")
+      (run-continue state)
       (is (prompt-is-card? state :corp caprice) "Caprice prompt even with no ice, once runner makes run")
       (is (prompt-is-card? state :runner caprice) "Runner has Caprice prompt")
       (click-prompt state :corp "2 [Credits]")
@@ -490,6 +493,7 @@
     (is (= [:hq] (get-in @state [:run :server])))
     (let [iwall (get-ice state :hq 0)]
       (core/rez state :corp iwall)
+      (run-continue state)
       (card-subroutine state :corp iwall 0)
       (is (not (:run @state)) "Run is ended")
       (is (get-in @state [:runner :register :unsuccessful-run]) "Run was unsuccessful"))))
@@ -501,11 +505,12 @@
       (new-game {:corp {:deck ["Masvingo"]}
                  :runner {:deck ["Laamb"]}})
       (play-from-hand state :corp "Masvingo" "HQ")
-      (core/rez state :corp (get-ice state :hq 0))
       (take-credits state :corp)
       (core/gain state :runner :credit 5)
       (play-from-hand state :runner "Laamb")
       (run-on state "HQ")
+      (core/rez state :corp (get-ice state :hq 0))
+      (run-continue state)
       (let [laamb (get-program state 0)]
         (is (= 2 (:current-strength (refresh laamb))) "Laamb starts at 2 strength")
         (is (= 6 (:credit (get-runner))) "Spent 4 to install")
@@ -517,11 +522,12 @@
       (new-game {:corp {:deck ["Masvingo"]}
                  :runner {:deck ["Ankusa"]}})
       (play-from-hand state :corp "Masvingo" "HQ")
-      (core/rez state :corp (get-ice state :hq 0))
       (take-credits state :corp)
       (core/gain state :runner :credit 5)
       (play-from-hand state :runner "Ankusa")
       (run-on state "HQ")
+      (core/rez state :corp (get-ice state :hq 0))
+      (run-continue state)
       (let [ank (get-program state 0)]
         (is (zero? (:current-strength (refresh ank))) "Ankusa starts at 1 strength")
         (is (= 4 (:credit (get-runner))) "Spent 6 to install")
@@ -582,8 +588,8 @@
      (new-game {:corp {:deck [(qty "Archer" 30)]}
                 :runner {:id "Laramy Fisk: Savvy Investor"
                          :deck ["Find the Truth"]}})
-
      (take-credits state :corp)
+     (click-card state :corp (first (:hand (get-corp))))
      (play-from-hand state :runner "Find the Truth")
      (letfn [(set-ftt-autoresolve [setting]
                (card-ability state :runner (get-resource state 0) 0)
@@ -593,20 +599,30 @@
                (click-prompt state :runner setting))
              (pass-turn-runner-corp []
                (take-credits state :runner)
+               (starting-hand state :corp ["Archer"])
                (take-credits state :corp))]
        ;; with nothing done, ftt and fisk will both want to prompt on a successful central run, so will need to be ordered
        ;; this will remain the case after one of them is set to 'Ask'
-       (dotimes [_ 2]
-        (run-empty-server state "Archives")
-        (changes-val-macro 1 (count (get-in @state [:corp :hand]))
-                           "Corp drew 1 card"
-                           (click-prompt state :runner "Laramy Fisk: Savvy Investor")
-                           (click-prompt state :runner "Yes"))
-        ;; resolve FTT
-        (click-prompt state :runner "Yes")
-        (click-prompt state :runner "OK")
-        (set-fisk-autoresolve "Ask")
-        (pass-turn-runner-corp))
+       (run-empty-server state "Archives")
+       (changes-val-macro 1 (count (get-in @state [:corp :hand]))
+         "Corp drew 1 card"
+         (click-prompt state :runner "Laramy Fisk: Savvy Investor")
+         (click-prompt state :runner "Yes"))
+       ;; resolve FTT
+       (click-prompt state :runner "Yes")
+       (click-prompt state :runner "OK")
+       (set-fisk-autoresolve "Ask")
+       (pass-turn-runner-corp)
+       (run-empty-server state "Archives")
+       (changes-val-macro 1 (count (get-in @state [:corp :hand]))
+         "Corp drew 1 card"
+         (click-prompt state :runner "Laramy Fisk: Savvy Investor")
+         (click-prompt state :runner "Yes"))
+       ;; resolve FTT
+       (click-prompt state :runner "Yes")
+       (click-prompt state :runner "OK")
+       (set-fisk-autoresolve "Ask")
+       (pass-turn-runner-corp)
        ;; if either is set to 'never', we should not need simult event resolution
        (set-fisk-autoresolve "Ask")
        (set-ftt-autoresolve "Never")
@@ -743,7 +759,8 @@
     (run-empty-server state "HQ")
     (play-from-hand state :runner "Apocalypse")
     (is (= #{"Hostile Infrastructure" "Marilyn Campaign" "Calvin B4L3Y"}
-           (->> (get-corp) :prompt first :choices (into #{}))) "Corp has the simultaneous prompt")
+           (into #{} (prompt-titles :corp)))
+        "Corp has the simultaneous prompt")
     (click-prompt state :corp "Marilyn Campaign")
     (click-prompt state :corp "Yes")
     (click-prompt state :corp "Calvin B4L3Y")
@@ -758,10 +775,11 @@
                :runner {:hand ["Saker"]
                         :credits 10}})
     (play-from-hand state :corp "Kakugo" "HQ")
-    (core/rez state :corp (get-ice state :hq 0))
     (take-credits state :corp)
     (play-from-hand state :runner "Saker")
     (run-on state "HQ")
+    (core/rez state :corp (get-ice state :hq 0))
+    (run-continue state)
     (card-ability state :runner (get-program state 0) 0)
     (click-prompt state :runner "End the run")
     (card-ability state :runner (get-program state 0) 2)

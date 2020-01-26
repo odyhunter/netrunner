@@ -23,12 +23,15 @@
          trace (partial-should-trigger? trace)
          :else true)))))
 
+(defn not-used-once?
+  [state {:keys [once once-key] :as ability} {:keys [cid] :as card}]
+  (not (get-in @state [once (or once-key cid)])))
+
 (defn can-trigger?
   "Checks if ability can trigger. Checks that once-per-turn is not violated."
-  [state side {:keys [once once-key] :as ability} card targets]
-  (let [cid (:cid card)]
-    (and (not (get-in @state [once (or once-key cid)]))
-         (should-trigger? state side card targets ability))))
+  [state side ability card targets]
+  (and (not-used-once? state ability card)
+       (should-trigger? state side card targets ability)))
 
 (defn is-ability?
   "Checks to see if a given map represents a card ability. Looks for :effect, :optional, :trace, or :psi."
@@ -62,10 +65,6 @@
         or 2) the keyword :req with a value of the req 5-fn returning true or false. Triggers a 'select' prompt
         with targeting cursor; only cards that cause the 1-argument function to return true will be allowed.
   :prompt -- a string or 4-argument function returning a string to display in the prompt menu.
-  :priority -- a numeric value, or true (equivalent to 1). Prompts are inserted into the prompt queue and sorted base
-               on priority, with higher priorities coming first. The sort is stable, so if two prompts have the same
-               priority, the prompt that was inserted first will remain first after the sort. You should rarely need
-               to use a priority larger than 1.
   :not-distinct -- true if the prompt should not collapse :choices entries of the same string to one button.
                    Defaults to false.
   :cancel-effect -- if the prompt uses a Cancel button, this 4-argument function will be called if the user
@@ -107,7 +106,7 @@
   ([state side {:keys [eid] :as ability} card targets]
    (resolve-ability state side (or eid (make-eid state {:source card :source-type :ability})) ability card targets))
   ([state side eid ability card targets]
-   (resolve-ability-eid state side (assoc ability :eid eid :source card :source-type :ability) card targets)))
+   (resolve-ability-eid state side (assoc ability :eid eid) card targets)))
 
 (defn- resolve-ability-eid
   [state side {:keys [eid optional psi trace choices] :as ability} card targets]
@@ -250,7 +249,7 @@
 
 (defn register-once
   "Register ability as having happened if :once specified"
-  [state {:keys [once once-key] :as ability} {:keys [cid] :as card}]
+  [state side {:keys [once once-key] :as ability} {:keys [cid] :as card}]
   (when once (swap! state assoc-in [once (or once-key cid)] true)))
 
 (defn- do-effect
@@ -264,7 +263,12 @@
   currently doesn't work properly with `pay-counters`"
   [card cost]
   ;; TODO: Remove me some day
-  (let [[counter-type counter-amount] (first (filter #(some #{:advancement :agenda :power :virus} %) (partition 2 cost)))]
+  (let [[counter-type counter-amount]
+        (->> cost
+             (remove map?)
+             merge-costs
+             (filter #(some #{:advancement :agenda :power :virus} %))
+             first)]
     (if counter-type
       (let [counter (if (= :advancement counter-type)
                       [:advance-counter]
@@ -281,7 +285,7 @@
               ;; Print the message
               (print-msg state side ability card targets cost-str)
               ;; Trigger the effect
-              (register-once state ability card)
+              (register-once state side ability card)
               (do-effect state side ability (ugly-counter-hack card cost) targets))))
 
 (defn active-prompt?
@@ -300,17 +304,18 @@
    (letfn [(prompt-fn [prompt-choice]
              (let [yes-ability (:yes-ability ability)
                    no-ability (:no-ability ability)
-                   end-effect (:end-effect ability)]
-               (if (and (= prompt-choice "Yes")
-                        yes-ability
-                        (can-pay? state side eid card (:title card) (:cost yes-ability)))
-                 (resolve-ability state side (assoc yes-ability :eid eid) card targets)
-                 (if no-ability
-                   (resolve-ability state side (assoc no-ability :eid eid) card targets)
-                   (effect-completed state side eid)))
-               (if end-effect
-                 (end-effect state side eid card nil))))]
-     (let [autoresolve-fn     (:autoresolve ability)
+                   end-effect (:end-effect ability)
+                   new-eid (make-eid state eid)
+                   ability-to-do (if (and (= prompt-choice "Yes")
+                                          yes-ability
+                                          (can-pay? state side eid card (:title card) (:cost yes-ability)))
+                                   yes-ability
+                                   no-ability)]
+               (wait-for (resolve-ability state side new-eid ability-to-do card targets)
+                         (when end-effect
+                           (end-effect state side new-eid card nil))
+                         (effect-completed state side eid))))]
+     (let [autoresolve-fn (:autoresolve ability)
            autoresolve-answer (when autoresolve-fn
                                 (autoresolve-fn state side eid card targets))]
        (case autoresolve-answer
@@ -349,7 +354,7 @@
   ([state side card psi] (psi-game state side (make-eid state {:source-type :psi}) card psi))
   ([state side eid card psi]
    (swap! state assoc :psi {})
-   (register-once state psi card)
+   (register-once state side psi card)
    (let [eid (assoc eid :source-type :psi)]
      (doseq [s [:corp :runner]]
        (let [all-amounts (range (min 3 (inc (total-available-credits state s eid card))))
@@ -515,7 +520,6 @@
                                        :base base
                                        :bonus bonus
                                        :link link
-                                       :priority (or priority 2)
                                        :corp-credits corp-credits
                                        :runner-credits runner-credits})]
                (trace-start state side eid card trace)))))

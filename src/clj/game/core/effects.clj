@@ -16,7 +16,7 @@
                         :card card
                         :uuid (uuid/v1)))]
       (swap! state update :effects
-             #(apply conj % abilities))
+             #(apply conj (into [] %) abilities))
       abilities)))
 
 (defn unregister-constant-effects
@@ -26,7 +26,7 @@
            (->> (:effects @state)
                 (remove #(and (same-card? card (:card %))
                               (= :constant (:duration %))))
-                doall))))
+                (into [])))))
 
 (defn register-floating-effect
   [state side card ability]
@@ -42,7 +42,7 @@
   (swap! state assoc :effects
          (->> (:effects @state)
               (remove #(= duration (:duration %)))
-              doall)))
+              (into []))))
 
 (defn gather-effects
   [state side effect-type]
@@ -50,7 +50,8 @@
         is-active-player #(= (:active-player @state) (get-side %))]
     (->> (:effects @state)
          (filter #(= effect-type (:type %)))
-         (sort-by (complement is-active-player)))))
+         (sort-by (complement is-active-player))
+         (into []))))
 
 (defn get-effects
   "Filters and then 'executes' the effects of a given type."
@@ -61,12 +62,21 @@
           (filter #(if-not (:req %)
                      true
                      ((:req %) state side eid (get-card state (:card %)) (cons card targets))))
-          (mapv #(if-not (fn? (:value %))
-                   (:value %)
-                   ((:value %) state side eid (get-card state (:card %)) (cons card targets))))))))
+          (map #(if-not (fn? (:value %))
+                  (:value %)
+                  ((:value %) state side eid (get-card state (:card %)) (cons card targets))))
+          (into [])))))
 
 (defn sum-effects
   "Sums the results from get-effects."
   ([state side card effect-type] (sum-effects state side card effect-type nil))
   ([state side card effect-type targets]
    (reduce + (filter identity (get-effects state side card effect-type targets)))))
+
+(defn any-effects
+  "Check if any effects return true for pred"
+  ([state side effect-type] (any-effects state side effect-type true? nil nil))
+  ([state side effect-type pred] (any-effects state side effect-type pred nil nil))
+  ([state side effect-type pred card] (any-effects state side effect-type pred card nil))
+  ([state side effect-type pred card targets]
+   (some pred (get-effects state side card effect-type targets))))

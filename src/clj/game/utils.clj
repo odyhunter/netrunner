@@ -1,5 +1,6 @@
 (ns game.utils
   (:require [clojure.string :refer [split-lines split join]]
+            [clojure.stacktrace :refer [print-stack-trace]]
             [jinteki.cards :refer [all-cards]]))
 
 (defn server-card
@@ -7,7 +8,10 @@
   (let [card (get @all-cards title)]
     (if (and title card)
       card
-      (.println *err* (str "Tried to select server-card for " title)))))
+      (.println *err* (with-out-str
+                        (print-stack-trace
+                          (Exception. (str "Tried to select server-card for " title))
+                          2500))))))
 
 (defn server-cards
   []
@@ -73,6 +77,9 @@
 
 (defn capitalize [string]
   (str (Character/toUpperCase (first string)) (subs string 1)))
+
+(defn decapitalize [string]
+  (str (Character/toLowerCase (first string)) (subs string 1)))
 
 (defn vdissoc [v n]
   (vec (concat (subvec v 0 n) (subvec v (inc n)))))
@@ -147,7 +154,11 @@
   "Checks if the two cards are the same by :cid. Alternatively specify 1-function to use to check the card"
   ([card1 card2] (same-card? :cid card1 card2))
   ([func card1 card2]
-    (= (func card1) (func card2))))
+   (let [id1 (func card1)
+         id2 (func card2)]
+     (and (some? id1)
+          (some? id2)
+          (= id1 id2)))))
 
 ;;; Functions for working with zones.
 (defn remote-num->name [num]
@@ -198,6 +209,13 @@
   [zone]
   (not (is-remote? zone)))
 
+(defn is-root?
+  "Returns true if the zone is root a central server"
+  [zone]
+  (and (is-central? (second zone))
+       (= :content (last zone)))
+)
+
 (defn central->zone
   "Converts a central server keyword like :discard into a corresponding zone vector"
   [zone]
@@ -236,8 +254,9 @@
 (defn remove-subtypes-once
   "Takes an existing subtype-string and removes one instance of
   each subtypes-to-remove"
-  [subtype-string subtypes-to-remove]
-  (let [types (split (or subtype-string " - ") #" - ")
+  [subtype-string & subtypes-to-remove]
+  (let [subtypes-to-remove (flatten subtypes-to-remove)
+        types (split (or subtype-string " - ") #" - ")
         part (join " - " (remove-once #(= % (first subtypes-to-remove)) types))
         left (rest subtypes-to-remove)]
     (if-not (empty? left)
@@ -261,18 +280,15 @@
   ([n string single-suffix plural-suffix]
    (str n " " (pluralize string single-suffix plural-suffix n))))
 
-(defn get-counters
-  "Get number of counters of specified type."
-  [card counter]
-  (cond
-    (= counter :advancement)
-    (:advance-counter card 0)
-    (= counter :recurring)
-    (:rec-counter card 0)
-    :else
-    (get-in card [:counter counter] 0)))
-
 (defn in-coll?
   "true if coll contains elm"
   [coll elm]
   (some #(= elm %) coll))
+
+(defn positions
+  "Returns the positions of elements in coll matching pred"
+  [pred coll]
+  (keep-indexed (fn [idx x]
+                  (when (pred x)
+                    idx))
+                coll))

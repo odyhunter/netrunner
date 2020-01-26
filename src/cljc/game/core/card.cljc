@@ -31,11 +31,13 @@
    type
    uniqueness])
 
-(def cid (atom 0))
+(let [cid (atom 0)]
+  (defn make-cid []
+    (swap! cid inc)))
 
-(defn make-cid
-  []
-  (swap! cid inc))
+(let [cid (atom 0)]
+  (defn make-installed-cid []
+    (swap! cid inc)))
 
 (defn private-card
   "Returns only the public information of a given card when it's in a private state,
@@ -112,6 +114,8 @@
   [card type]
   (card-is? card :type type))
 
+(declare facedown?)
+
 (defn agenda?
   [card]
   (is-type? card "Agenda"))
@@ -122,11 +126,13 @@
 
 (defn event?
   [card]
-  (is-type? card "Event"))
+  (and (not (facedown? card))
+       (is-type? card "Event")))
 
 (defn hardware?
   [card]
-  (is-type? card "Hardware"))
+  (and (not (facedown? card))
+       (is-type? card "Hardware")))
 
 (defn ice?
   [card]
@@ -147,11 +153,13 @@
 
 (defn program?
   [card]
-  (is-type? card "Program"))
+  (and (not (facedown? card))
+       (is-type? card "Program")))
 
 (defn resource?
   [card]
-  (is-type? card "Resource"))
+  (and (not (facedown? card))
+       (is-type? card "Resource")))
 
 (defn upgrade?
   [card]
@@ -225,6 +233,17 @@
            (not (rezzed? card)))
       (and (is-type? card "Agenda")
            (installed? card))))
+
+(defn get-counters
+  "Get number of counters of specified type."
+  [card counter]
+  (cond
+    (= counter :advancement)
+    (+ (:advance-counter card 0) (:extra-advance-counter card 0))
+    (= counter :recurring)
+    (:rec-counter card 0)
+    :else
+    (get-in card [:counter counter] 0)))
 
 (defn get-nested-host
   "Recursively searches upward to find the 'root' card of a hosting chain."

@@ -1,8 +1,9 @@
-(ns game-test.engine.scenarios
+(ns game.engine.scenarios-test
   (:require [game.core :as core]
-            [game-test.core :refer :all]
-            [game-test.utils :refer :all]
-            [game-test.macros :refer :all]
+            [game.core.card :refer :all]
+            [game.core-test :refer :all]
+            [game.utils-test :refer :all]
+            [game.macros-test :refer :all]
             [clojure.test :refer :all]))
 
 (deftest degree-mill-cvs
@@ -116,6 +117,7 @@
         (is (= 1 (:credit (get-runner))))
         (run-on state "HQ")
         (core/rez state :corp ash)
+        (run-continue state)
         (run-successful state)
         (click-prompt state :corp "0")
         (click-prompt state :runner "0")
@@ -137,6 +139,7 @@
         (core/gain state :runner :credit 1)
         (play-from-hand state :runner "Dirty Laundry")
         (click-prompt state :runner "HQ")
+        (run-continue state)
         (run-successful state)
         (click-prompt state :runner "Steal")
         (is (= 2 (:agenda-point (get-runner))) "Stole Global Food Initiative")
@@ -146,6 +149,7 @@
         (let [tur (get-ice state :remote1 0)
               cap (get-content state :remote1 2)]
           (core/rez state :corp tur)
+          (run-continue state)
           (is (= 5 (:current-strength (refresh tur))) "Turing +3 strength protecting a remote")
           (card-subroutine state :corp tur 0) ; end the run
           (click-prompt state :runner "End the run")

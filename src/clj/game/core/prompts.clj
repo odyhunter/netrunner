@@ -1,6 +1,7 @@
 (ns game.core.prompts
   (:require [game.core.eid :refer [make-eid effect-completed]]
-            [game.core.toasts :refer [toast]]))
+            [game.core.toasts :refer [toast]]
+            [clj-uuid :as uuid]))
 
 (defn- add-to-prompt-queue
   "Adds a newly created prompt to the current prompt queue"
@@ -9,7 +10,17 @@
         split-fn #(>= (priority-comp (:priority %)) (priority-comp priority))
         ;; insert the new prompt into the already-sorted queue based on its priority.
         update-fn #(let [[head tail] (split-with split-fn %)] (concat head (cons prompt tail)))]
-    (swap! state update-in [side :prompt] update-fn)))
+    (swap! state update-in [side :prompt] #(cons prompt %))))
+
+(defn choice-parser
+  [choices]
+  (if (or (map? choices) (keyword? choices))
+    choices
+    (into
+      []
+      (for [choice choices]
+        {:value choice
+         :uuid (uuid/v1)}))))
 
 (defn show-prompt
   "Engine-private method for displaying a prompt where a *function*, not a card ability, is invoked
@@ -19,6 +30,7 @@
   ([state side eid card message choices f
     {:keys [priority prompt-type show-discard cancel-effect end-effect] :as args}]
    (let [prompt (if (string? message) message (message state side nil card nil))
+         choices (choice-parser choices)
          newitem {:eid eid
                   :msg prompt
                   :choices choices
@@ -26,7 +38,6 @@
                   :card card
                   :prompt-type prompt-type
                   :show-discard show-discard
-                  :priority priority
                   :cancel-effect cancel-effect
                   :end-effect end-effect}]
      (when (or (= prompt-type :waiting)
@@ -41,7 +52,7 @@
   If user chooses to roll d6, reveal the result to user and re-display
   the prompt without the 'roll d6 button'."
   ([state side card message other-choices f]
-   (show-prompt state side card message other-choices f nil))
+   (show-prompt-with-dice state side card message other-choices f nil))
   ([state side card message other-choices f args]
    (let [dice-msg "Roll a d6",
          choices (conj other-choices dice-msg)]
@@ -69,7 +80,6 @@
                   :prompt-type :trace
                   :effect f
                   :card card
-                  :priority priority
                   :player player
                   :other other
                   :base base
@@ -81,17 +91,18 @@
 (defn resolve-select
   "Resolves a selection prompt by invoking the prompt's ability with the targeted cards.
   Called when the user clicks 'Done' or selects the :max number of cards."
-  [state side update! resolve-ability]
+  [state side card args update! resolve-ability]
   (let [selected (get-in @state [side :selected 0])
         cards (map #(dissoc % :selected) (:cards selected))
-        curprompt (first (get-in @state [side :prompt]))]
+        prompt (first (filter #(= :select (:prompt-type %)) (get-in @state [side :prompt])))]
     (swap! state update-in [side :selected] #(vec (rest %)))
-    (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % curprompt) pr)))
-    (if-not (empty? cards)
+    (when prompt
+      (swap! state update-in [side :prompt] (fn [prompts] (remove #(= % prompt) prompts))))
+    (if (seq cards)
       (do (doseq [card cards]
             (update! state side card))
-          (resolve-ability state side (:ability selected) (:card curprompt) cards))
-      (if-let [cancel-effect (:cancel-effect curprompt)]
+          (resolve-ability state side (:ability selected) card cards))
+      (if-let [cancel-effect (:cancel-effect args)]
         (cancel-effect nil)
         (effect-completed state side (:eid (:ability selected)))))))
 
@@ -108,7 +119,9 @@
            all (get-in ability [:choices :all])
            m (get-in ability [:choices :max])]
        (swap! state update-in [side :selected]
-              #(conj (vec %) {:ability (dissoc ability :choices)
+              #(conj (vec %) {:ability (-> ability
+                                           (dissoc :choices)
+                                           (assoc :card card))
                               :card (get-in ability [:choices :card])
                               :req (get-in ability [:choices :req])
                               :not-self (when (get-in ability [:choices :not-self]) (:cid card))
@@ -125,7 +138,10 @@
                       (fn [choice]
                         (toast state side (str "You must choose " m))
                         (show-select state side card ability args))
-                      (fn [choice] (resolve-select state side update! resolve-ability)))
+                      (fn [choice]
+                        (resolve-select state side card
+                                        (select-keys (wrap-function args :cancel-effect) [:cancel-effect])
+                                        update! resolve-ability)))
                     (-> args
                         (assoc :prompt-type :select
                                :show-discard (:show-discard ability))
@@ -144,5 +160,5 @@
 (defn clear-wait-prompt
   "Removes the first 'Waiting for...' prompt from the given side's prompt queue."
   [state side]
-  (when-let [wait (some #(when (= :waiting (:prompt-type %)) %) (-> @state side :prompt))]
-    (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % wait) pr)))))
+  (when-let [wait (first (filter #(= :waiting (:prompt-type %)) (-> @state side :prompt)))]
+    (swap! state update-in [side :prompt] (fn [pr] (remove #(= % wait) pr)))))

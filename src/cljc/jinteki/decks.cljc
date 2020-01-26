@@ -47,7 +47,7 @@
 (defn min-deck-size
   "Contains implementation-specific decksize adjustments, if they need to be different from printed ones."
   [identity]
-  (:minimumdecksize identity))
+  (:minimumdecksize identity 0))
 
 (defn min-agenda-points
   [deck]
@@ -277,10 +277,10 @@
 (defn build-socr-legality
   [valid deck]
   (let [mwl (legal-format? :socr deck)
-        big-boxes ["creation-and-control"
-                   "honor-and-profit"
+        big-boxes ["honor-and-profit"
                    "order-and-chaos"
-                   "data-and-destiny"]
+                   "data-and-destiny"
+                   "reign-and-reverie"]
         single-set? (as-> deck d
                       (combine-id-and-cards d)
                       (group-by #(get-in % [:card :cycle_code]) d)

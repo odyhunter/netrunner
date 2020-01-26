@@ -14,10 +14,11 @@
                     :else 0)
          new-sub {:label (make-label sub)
                   :from-cid cid
-                  :sub-effect sub
+                  :sub-effect (dissoc sub :breakable)
                   :position position
                   :variable (or variable false)
-                  :printed (or printed false)}
+                  :printed (or printed false)
+                  :breakable (:breakable sub true)}
          new-subs (->> (conj curr-subs new-sub)
                        (sort-by :position)
                        (map-indexed (fn [idx sub] (assoc sub :index idx)))
@@ -32,18 +33,37 @@
    (trigger-event state side :subroutines-changed (get-card state ice))))
 
 (defn remove-sub
-  "Removes a single sub from a piece of ice. By default removes the first subroutine
+  "Removes a single sub from a piece of ice for pred. By default removes the first subroutine
   with the same cid as the given ice."
   ([ice] (remove-sub ice #(= (:cid ice) (:from-cid %))))
   ([ice pred]
-   (let [curr-subs (:subroutines ice)
-         new-subs (remove-once pred curr-subs)]
+   (let [new-subs (->> (:subroutines ice)
+                       (remove-once pred)
+                       (map-indexed (fn [idx sub] (assoc sub :index idx)))
+                       (into []))]
      (assoc ice :subroutines new-subs))))
 
 (defn remove-sub!
   ([state side ice] (remove-sub! state side ice #(= (:cid ice) (:from-cid %))))
   ([state side ice pred]
    (update! state :corp (remove-sub ice pred))
+   (trigger-event state side :subroutines-changed (get-card state ice))))
+
+(defn remove-subs
+  "Removes all subs from a piece of ice for pred. By default removes the subroutines
+  with the same cid as the given ice."
+  ([ice] (remove-sub ice #(= (:cid ice) (:from-cid %))))
+  ([ice pred]
+   (let [new-subs (->> (:subroutines ice)
+                       (remove pred)
+                       (map-indexed (fn [idx sub] (assoc sub :index idx)))
+                       (into []))]
+     (assoc ice :subroutines new-subs))))
+
+(defn remove-subs!
+  ([state side ice] (remove-subs! state side ice #(= (:cid ice) (:from-cid %))))
+  ([state side ice pred]
+   (update! state :corp (remove-subs ice pred))
    (trigger-event state side :subroutines-changed (get-card state ice))))
 
 (defn add-extra-sub!
@@ -92,6 +112,30 @@
   ([state ice breaker]
    (update! state :corp (break-all-subroutines ice breaker))))
 
+(defn any-subs-broken?
+  [ice]
+  (some :broken (:subroutines ice)))
+
+(defn all-subs-broken?
+  [ice]
+  (let [subroutines (:subroutines ice)]
+    (and (seq subroutines)
+         (every? :broken subroutines))))
+
+(defn any-subs-broken-by-card?
+  [ice card]
+  (some #(and (:broken %)
+              (= (:cid card) (:breaker %)))
+        (:subroutines ice)))
+
+(defn all-subs-broken-by-card?
+  [ice card]
+  (let [subroutines (:subroutines ice)]
+    (and (seq subroutines)
+         (every? #(and (:broken %)
+                       (= (:cid card) (:breaker %)))
+                 subroutines))))
+
 (defn dont-resolve-subroutine
   "Marks a given subroutine as not resolving (e.g. Mass-Driver)"
   [ice sub]
@@ -128,10 +172,24 @@
   [state ice]
   (update! state :corp (reset-all-subs ice)))
 
+(defn reset-all-ice
+  [state _]
+  (doseq [ice (filter ice? (all-installed state :corp))]
+    (reset-all-subs! state ice)))
+
 (defn unbroken-subroutines-choice
-  "Takes an ice, returns the ubroken subroutines for a choices prompt"
+  "Takes an ice, returns the unbroken subroutines for a choices prompt"
   [ice]
-  (for [sub (remove #(or (:broken %) (= false (:resolve %))) (:subroutines ice))]
+  (for [sub (remove #(or (:broken %) (not (:resolve % true))) (:subroutines ice))]
+    (make-label (:sub-effect sub))))
+
+(defn breakable-subroutines-choice
+  "Takes an ice, returns the breakable subroutines for a choices prompt"
+  [state side eid card ice]
+  (for [sub (remove #(or (:broken %)
+                         (not (if (fn? (:breakable %))
+                                ((:breakable %) state side eid ice [card])
+                                (:breakable % true)))) (:subroutines ice))]
     (make-label (:sub-effect sub))))
 
 (defn resolve-subroutine
@@ -156,7 +214,6 @@
   ([state side eid ice subroutines msgs]
    (if (and (seq subroutines)
             (:run @state)
-            (not (get-in @state [:run :ending]))
             (not (get-in @state [:run :ended])))
      (let [sub (first subroutines)]
        (wait-for (resolve-subroutine! state side (make-eid state eid) ice sub)
@@ -193,7 +250,9 @@
   "Sums the results from get-effects."
   [state side ice]
   (let [can-lower? (not (card-flag? ice :cannot-lower-strength true))]
-    (reduce + (filter #(and % (or can-lower? (pos? %))) (get-effects state side ice :ice-strength nil)))))
+    (->> (get-effects state side ice :ice-strength nil)
+         (filter #(and % (or can-lower? (pos? %))))
+         (reduce +))))
 
 (defn ice-strength
   "Gets the modified strength of the given ice."
@@ -267,14 +326,14 @@
   "Change a breaker's strength by n for the given duration of :end-of-encounter, :end-of-run or :end-of-turn"
   ([state side card n] (pump state side card n :end-of-encounter))
   ([state side card n duration]
-   (register-floating-effect
-     state side (get-card state card)
-     {:type :breaker-strength
-      :duration duration
-      :req (req (same-card? card target))
-      :value n})
-   (update-breaker-strength state side (get-card state card))
-   (trigger-event state side :pump-breaker (get-card state card) n)))
+   (let [floating-effect (register-floating-effect
+                           state side (get-card state card)
+                           {:type :breaker-strength
+                            :duration duration
+                            :req (req (same-card? card target))
+                            :value n})]
+     (update-breaker-strength state side (get-card state card))
+     (trigger-event state side :pump-breaker (get-card state card) floating-effect))))
 
 (defn pump-all-icebreakers
   ([state side n] (pump-all-icebreakers state side n :end-of-encounter))
@@ -299,9 +358,9 @@
                  (when (and target-count (< 1 target-count))
                    (str " (" (count broken-subs)
                         " of " target-count ")")))
-    :choices (req (concat (unbroken-subroutines-choice ice)
+    :choices (req (concat (breakable-subroutines-choice state side eid card ice)
                           (when-not (and (:all args)
-                                         (pos? (count (unbroken-subroutines-choice ice)))
+                                         (pos? (count (breakable-subroutines-choice state side eid card ice)))
                                          (< 1 target-count))
                             '("Done"))))
     :effect (req (if (= "Done" target)
@@ -309,17 +368,19 @@
                                                          :early-exit true})
                    (let [sub (first (filter #(and (not (:broken %)) (= target (make-label (:sub-effect %)))) (:subroutines ice)))
                          ice (break-subroutine ice sub)
-                         broken-subs (cons sub broken-subs)]
-                     (if (and (pos? (count (unbroken-subroutines-choice ice)))
+                         broken-subs (cons sub broken-subs)
+                         breakable-subs (breakable-subroutines-choice state side eid card ice)]
+                     (if (and (pos? (count breakable-subs))
                               (< (count broken-subs) (if (pos? target-count) target-count (count (:subroutines ice)))))
                        (continue-ability state side (break-subroutines-impl ice target-count broken-subs args) card nil)
                        (complete-with-result state side eid {:broken-subs broken-subs
-                                                             :early-exit false})))))}))
+                                                             :early-exit (zero? (count breakable-subs))})))))}))
 
 (defn break-subroutines-msg
-  ([ice broken-subs] (break-subroutines-msg ice broken-subs nil))
-  ([ice broken-subs args]
-   (str "break " (quantify (count broken-subs)
+  ([ice broken-subs breaker] (break-subroutines-msg ice broken-subs breaker nil))
+  ([ice broken-subs breaker args]
+   (str "use " (:title breaker)
+        " to break " (quantify (count broken-subs)
                            (str (when-let [subtype (:subtype args)]
                                   (when (not= "All" subtype)
                                     (str subtype " ")))
@@ -330,12 +391,6 @@
               (map :label (sort-by :index broken-subs)))
         "\")")))
 
-(defn- break-subroutines-pay
-  [ice cost broken-subs args]
-  (when (seq broken-subs)
-    {:msg (break-subroutines-msg ice broken-subs args)
-     :cost cost}))
-
 (defn break-subroutines
   ([ice breaker cost n] (break-subroutines ice breaker cost n nil))
   ([ice breaker cost n args]
@@ -343,25 +398,43 @@
                       :all false}
                      args)]
      {:async true
-      :effect (req (wait-for (resolve-ability state side (break-subroutines-impl ice (if (zero? n) (count (:subroutines current-ice)) n) '() args) card nil)
-                             (let [broken-subs (:broken-subs async-result)
-                                   early-exit (:early-exit async-result)]
-                               (wait-for (resolve-ability state side (make-eid state {:source-type :ability})
-                                                          (break-subroutines-pay ice cost broken-subs args) card nil)
-                                         (doseq [sub broken-subs]
-                                           (break-subroutine! state (get-card state ice) sub breaker)
-                                           (resolve-ability state side (make-eid state {:source card :source-type :ability})
-                                                            (:additional-ability args)
-                                                            card nil))
-                                         (let [ice (get-card state ice)
-                                               card (get-card state card)]
-                                           (if (and (not early-exit)
-                                                    (:repeatable args)
-                                                    (seq broken-subs)
-                                                    (pos? (count (unbroken-subroutines-choice ice)))
-                                                    (can-pay? state side eid (get-card state card) nil cost))
-                                             (continue-ability state side (break-subroutines ice breaker cost n args) card nil)
-                                             (effect-completed state side eid)))))))})))
+      :effect (req (wait-for
+                     (resolve-ability state side (break-subroutines-impl ice (if (zero? n) (count (:subroutines current-ice)) n) '() args) card nil)
+                     (let [broken-subs (:broken-subs async-result)
+                           early-exit (:early-exit async-result)
+                           total-cost (when (seq broken-subs)
+                                        (break-sub-ability-cost state side
+                                                                (assoc args
+                                                                       :cost cost
+                                                                       :broken-subs broken-subs)
+                                                                card ice))
+                           message (when (seq broken-subs)
+                                     (break-subroutines-msg ice broken-subs breaker args))]
+                       (wait-for (pay-sync state side (make-eid state {:source-type :ability}) card total-cost)
+                                 (if-let [cost-str async-result]
+                                   (do (system-msg state :runner (str cost-str " to " message))
+                                       (doseq [sub broken-subs]
+                                         (break-subroutine! state (get-card state ice) sub breaker)
+                                         (resolve-ability state side (make-eid state {:source card :source-type :ability})
+                                                          (:additional-ability args)
+                                                          card nil))
+                                       (let [ice (get-card state ice)
+                                             on-break-subs (when ice (:on-break-subs (card-def ice)))
+                                             event-args (when on-break-subs {:card-abilities (ability-as-handler ice on-break-subs)})]
+                                         (wait-for
+                                           (trigger-event-simult state side :subroutines-broken event-args ice broken-subs)
+                                           (let [ice (get-card state ice)
+                                                 card (get-card state card)]
+                                             (if (and ice
+                                                      card
+                                                      (not early-exit)
+                                                      (:repeatable args)
+                                                      (seq broken-subs)
+                                                      (pos? (count (unbroken-subroutines-choice ice)))
+                                                      (can-pay? state side eid (get-card state card) nil cost))
+                                               (continue-ability state side (break-subroutines ice breaker cost n args) card nil)
+                                               (effect-completed state side eid))))))
+                                   (effect-completed state side eid))))))})))
 
 (defn break-sub
   "Creates a break subroutine ability.
@@ -374,36 +447,47 @@
   ([cost n subtype args]
    (let [cost (if (number? cost) [:credit cost] cost)
          subtype (or subtype "All")
-         args (assoc args :subtype subtype)
+         args (assoc args :subtype subtype :break n)
          break-req (req (and current-ice
                              (rezzed? current-ice)
+                             (= :encounter-ice (:phase run))
                              (if subtype
                                (or (= subtype "All")
                                    (has-subtype? current-ice subtype)))
-                             (seq (remove :broken (:subroutines current-ice)))
+                             (pos? (count (breakable-subroutines-choice state side eid card current-ice)))
                              (if (:req args)
                                ((:req args) state side eid card targets)
                                true)))
          strength-req (req (if (has-subtype? card "Icebreaker")
                              (<= (get-strength current-ice) (get-strength card))
                              true))]
-     {:req (req (and (break-req state side eid card targets)
-                     (strength-req state side eid card targets)))
-      :break-req break-req
-      :break n
-      :breaks subtype
-      :break-cost cost
-      :additional-ability (:additional-ability args)
-      :label (str (when cost (str (build-cost-label cost) ": "))
-                  (or (:label args)
-                      (str "break "
-                           (when (< 1 n) "up to ")
-                           (if (pos? n) n "any number of")
-                           (when (not= "All" subtype) (str " " subtype))
-                           (pluralize " subroutine" n))))
-      :effect (effect (continue-ability
-                        (break-subroutines current-ice card cost n args)
-                        card nil))})))
+     (merge
+       (when (some #(= :trash (first %)) (merge-costs cost))
+         {:trash-icon true})
+       {:req (req (and (break-req state side eid card targets)
+                       (strength-req state side eid card targets)))
+        :break-req break-req
+        :break n
+        :breaks subtype
+        :break-cost cost
+        :additional-ability (:additional-ability args)
+        :label (str (when cost (str (build-cost-label cost) ": "))
+                    (or (:label args)
+                        (str "break "
+                             (when (< 1 n) "up to ")
+                             (if (pos? n) n "any number of")
+                             (when (not= "All" subtype) (str " " subtype))
+                             (pluralize " subroutine" n))))
+        :effect (effect (continue-ability
+                          (when (can-pay? state side
+                                          (assoc eid :source-type :ability)
+                                          card nil
+                                          (break-sub-ability-cost
+                                            state side
+                                            (assoc args :cost cost :broken-subs (take n (:subroutines current-ice)))
+                                            card current-ice))
+                            (break-subroutines current-ice card cost n args))
+                          card nil))}))))
 
 (defn strength-pump
   "Creates a strength pump ability.
@@ -430,16 +514,17 @@
       :pump strength
       :effect (effect (pump card strength duration))})))
 
+
 (def breaker-auto-pump
   "Updates an icebreaker's abilities with a pseudo-ability to trigger the
   auto-pump routine in core, IF we are encountering a rezzed ice with a subtype
   we can break."
-  {:effect
+  {:silent (req true)
+   :effect
    (req (let [abs (remove #(or (= (:dynamic %) :auto-pump)
                                (= (:dynamic %) :auto-pump-and-break))
                           (:abilities card))
-              current-ice (when-not (or (get-in @state [:run :ending])
-                                        (get-in @state [:run :ended]))
+              current-ice (when-not (get-in @state [:run :ended])
                             (get-card state current-ice))
               ;; match strength
               can-pump (fn [ability]
@@ -464,6 +549,10 @@
               subs-broken-at-once (when break-ability
                                     (:break break-ability 1))
               unbroken-subs (count (remove :broken (:subroutines current-ice)))
+              no-unbreakable-subs (empty? (filter #(if (fn? (:breakable %)) ; filter for possibly unbreakable subs
+                                                     (not= :unrestricted ((:breakable %) state side eid current-ice [card]))
+                                                     (not (:breakable % true))) ; breakable is a bool
+                                                  (:subroutines current-ice)))
               times-break (when (and (pos? unbroken-subs)
                                      subs-broken-at-once)
                             (if (pos? subs-broken-at-once)
@@ -477,8 +566,10 @@
                    (assoc card :abilities
                           (if (and (seq total-cost)
                                    (rezzed? current-ice)
+                                   (= :encounter-ice (:phase run))
                                    break-ability)
                             (vec (concat (when (and break-ability
+                                                    no-unbreakable-subs
                                                     (pos? unbroken-subs)
                                                     (can-pay? state side eid card total-cost))
                                            [{:dynamic :auto-pump-and-break
@@ -501,7 +592,7 @@
 ;; hooks up breaker-auto-pump to the necessary events.
 ;; IMPORTANT: Events on cdef take precedence, and should call
 ;; (:effect breaker-auto-pump) themselves.
-(let [events (for [event [:run :approach-ice :pass-ice :run-ends
+(let [events (for [event [:run :approach-ice :encounter-ice :pass-ice :run-ends
                           :ice-strength-changed :ice-subtype-changed :breaker-strength-changed
                           :subroutines-changed]]
                (assoc breaker-auto-pump :event event))]

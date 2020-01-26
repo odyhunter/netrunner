@@ -1,11 +1,17 @@
 (in-ns 'game.core)
 
-(declare can-run? can-trash? card-init card-str cards-can-prevent? close-access-prompt enforce-msg
-         gain-agenda-point get-prevent-list get-agenda-points in-corp-scored? play-sfx
+(declare can-run? can-trash? card-init card-str cards-can-prevent? check-winner close-access-prompt
+         enforce-msg get-prevent-list get-agenda-points in-corp-scored? play-sfx
          prevent-draw remove-old-current should-trigger? system-say system-msg steal-trigger-events
-         trash-cards untrashable-while-rezzed? update-all-ice untrashable-while-resources? win win-decked)
+         trash-cards untrashable-while-rezzed? update-all-agenda-points update-all-ice
+         untrashable-while-resources? win win-decked)
 
 ;;;; Functions for applying core Netrunner game rules.
+
+(defn fake-move
+  [state side eid c args]
+  (move state side c :rfg)
+  (effect-completed state side eid))
 
 ;;; Playing cards.
 (defn- complete-play-instant
@@ -32,27 +38,29 @@
       (let [card (get-card state card)]
         (wait-for (trigger-event-sync state side (if (= side :corp) :play-operation :play-event) card)
                   ;; Resolve ability, removing :req as that has already been checked
-                  (wait-for (resolve-ability state side (dissoc cdef :req) card nil)
+                  (wait-for (resolve-ability state side (dissoc cdef :req :cost :additional-cost) card nil)
                             (let [c (some #(when (same-card? card %) %) (get-in @state [side :play-area]))
+                                  trash-after-resolving (:trash-after-resolving cdef true)
                                   zone (if (:rfg-instead-of-trashing c) :rfg :discard)]
-                              (when c
-                                (move state side c zone)
-                                (unregister-events state side card)
-                                (unregister-constant-effects state side card)
-                                (when (= zone :rfg)
-                                  (system-msg state side
-                                              (str " removes " (:title c) " from the game instead of trashing it")))))
-                            (when (has-subtype? card "Terminal")
-                              (lose state side :click (-> @state side :click))
-                              (swap! state assoc-in [:corp :register :terminal] true))
-                            (effect-completed state side eid)))))))
+                              (if (and c trash-after-resolving)
+                                (let [trash-or-move (if (= zone :rfg) fake-move trash)]
+                                  (wait-for (trash-or-move state side c {:unpreventable true})
+                                            (unregister-events state side card)
+                                            (unregister-constant-effects state side card)
+                                            (when (= zone :rfg)
+                                              (system-msg state side
+                                                          (str "removes " (:title c) " from the game instead of trashing it")))
+                                            (when (has-subtype? card "Terminal")
+                                              (lose state side :click (-> @state side :click))
+                                              (swap! state assoc-in [:corp :register :terminal] true))
+                                            (effect-completed state side eid)))
+                                (do (when (has-subtype? card "Terminal")
+                                      (lose state side :click (-> @state side :click))
+                                      (swap! state assoc-in [:corp :register :terminal] true))
+                                    (effect-completed state side eid))))))))))
 
 (defn play-instant
   "Plays an Event or Operation."
-  ([state side card] (play-instant state side (make-eid state) card nil))
-  ([state side eid? card?] (if (:eid eid?)
-                             (play-instant state side eid? card? nil)
-                             (play-instant state side (make-eid state) eid? card?)))
   ([state side eid card {:keys [targets ignore-cost base-cost no-additional-cost]}]
    (let [eid (eid-set-defaults eid :source nil :source-type :play)
          cdef (card-def card)
@@ -191,11 +199,10 @@
                           "meat" :meat)
             prevented (get-in @state [:damage :damage-prevent promptdtype] 0)
             newprompt (assoc oldprompt :msg (str "Prevent any of the " dnumber " " (name promptdtype) " damage? (" prevented "/" dnumber " prevented)"))
-            update-fn #(cons newprompt (rest %))
-            done-update-fn #(rest %)]
+            update-fn #(cons newprompt (rest %))]
         (if (>= prevented dnumber)
-          (do ((:effect oldprompt) nil)
-              (swap! state update-in [side :prompt] done-update-fn))
+          (do (swap! state update-in [side :prompt] next)
+              ((:effect oldprompt) nil))
           (swap! state update-in [side :prompt] update-fn))))))
 
 (defn damage-prevent
@@ -299,7 +306,7 @@
              (fn [_] (let [prevent (get-in @state [:damage :damage-prevent type])]
                        (when prevent (trigger-event state side :prevented-damage type prevent))
                        (system-msg state :runner
-                                   (if prevent (str "prevents " (if (= prevent Integer/MAX_VALUE) "all" prevent)
+                                   (if prevent (str "prevents " (if (>= prevent Integer/MAX_VALUE) "all" prevent)
                                                     " " (name type) " damage") "will not prevent damage"))
                        (clear-wait-prompt state :corp)
                        (resolve-damage state side eid type (max 0 (- n (or prevent 0))) args)))
@@ -507,14 +514,18 @@
   added or not added to the trash list, all of those cards are trashed"
   ([state side cards] (trash-cards state side (make-eid state) cards nil))
   ([state side eid cards] (trash-cards state side eid cards nil))
-  ([state side eid cards {:keys [cause suppress-event keep-server-alive host-trashed] :as args}]
+  ([state side eid cards {:keys [cause keep-server-alive host-trashed game-trash] :as args}]
    (let [num-cards (< 1 (count cards))]
-     (letfn [(get-card? [s c] (if num-cards (get-card s c) c))
+     (letfn [(get-card? [s c]
+               ;; Holdover from old code. Should be `get-card` in all cases, but that
+               ;; requires fixing a bunch of cards and there's not been time yet.
+               (if num-cards (get-card s c) c))
              (preventrec [cs]
                (if (seq cs)
                  (wait-for (prevent-trash state side (get-card? state (first cs)) eid args)
                            (preventrec (rest cs)))
                  (let [trashlist (get-in @state [:trash :trash-list eid])
+                       ;; Criteria for abilities that trigger when the card is trashed
                        get-trash-effect (fn [card]
                                           (when (and card
                                                      (not (:disabled card))
@@ -524,22 +535,47 @@
                                                          (and (rezzed? card)
                                                               (not host-trashed))
                                                          (and (:when-inactive (:trash-effect (card-def card)))
-                                                              (not host-trashed))))
+                                                              (not host-trashed))
+                                                         (in-play-area? card)))
                                             (:trash-effect (card-def card))))
+                       ;; No card should end up in the opponent's discard pile, so instead
+                       ;; of using `side`, we use the card's `:side`.
+                       move-card #(move state (to-keyword (:side %)) % :discard {:keep-server-alive keep-server-alive})
+                       ;; Perform the move of the cards from their current location to
+                       ;; the discard. At the same time, gather their `:trash-effect`s
+                       ;; to be used in the simult event later.
                        moved-cards (->> trashlist
                                         (map #(get-card? state %))
                                         (filter identity)
-                                        (map (juxt #(move state (to-keyword (:side %)) % :discard {:keep-server-alive keep-server-alive})
-                                                   get-trash-effect))
+                                        ;; juxt is used to perform both the move and
+                                        ;; `get-trash-effect` on each card in the list.
+                                        ;; This gives us a list of tuples:
+                                        ;; the moved card and the trash effect
+                                        ;; This is used when we build the `card-abilities`
+                                        ;; list of effects, applying the pair to
+                                        ;; `ability-as-handler`, which is the format
+                                        ;; `trigger-event-simult` handles the additional
+                                        ;; abilities.
+                                        (map (juxt move-card get-trash-effect))
+                                        (map #(apply ability-as-handler %))
                                         (into []))]
                    (swap! state update-in [:trash :trash-list] dissoc eid)
                    (when (seq (remove #{side} (map #(to-keyword (:side %)) trashlist)))
                      (swap! state assoc-in [side :register :trashed-card] true))
-                   (apply trigger-event-simult state side eid
-                          (when-not suppress-event
-                            (if (= side :corp) :corp-trash :runner-trash))
-                          {:card-abilities (map #(apply ability-as-handler %) moved-cards)}
-                          (first trashlist) cause (rest trashlist)))))]
+                   (let [;; The trash event will be determined by who is performing the
+                         ;; trash. `:game-trash` in this case refers to when a checkpoint
+                         ;; sees a card has been trashed and it has hosted cards, so it
+                         ;; trashes each hosted card. (Rule 10.3.1g)
+                         ;; This doesn't count as either player trashing the card, but
+                         ;; the cards are counted as trashed by the engine and so
+                         ;; abilities that don't care who performed the trash (Simulchip
+                         ;; for example) still need it either logged or watchable.
+                         trash-event (cond
+                                       game-trash :game-trash
+                                       (= side :corp) :corp-trash
+                                       (= side :runner) :runner-trash)
+                         targets (concat trashlist (list {:cause cause}))]
+                     (apply trigger-event-simult state side eid trash-event {:card-abilities moved-cards} targets)))))]
        (preventrec cards)))))
 
 (defn trash
@@ -552,18 +588,16 @@
   "Apply agenda-point modifications to calculate the number of points this card is worth
   to the given player."
   [state side card]
-  (let [base-points (:agendapoints card)
-        runner-fn (:agendapoints-runner (card-def card))
-        corp-fn (:agendapoints-corp (card-def card))]
-    (cond
-      (and (= side :runner)
-           (some? runner-fn))
-      (runner-fn state side (make-eid state) card nil)
-      (and (= side :corp)
-           (some? corp-fn))
-      (corp-fn state side (make-eid state) card nil)
-      :else
-      base-points)))
+  (let [base-points (:agendapoints card 0)
+        as-agenda-points (:as-agenda-points card 0)
+        points-fn (if (= side :corp)
+                    (:agendapoints-corp (card-def card))
+                    (:agendapoints-runner (card-def card)))]
+    (if (fn? points-fn)
+      (points-fn state side nil card nil)
+      (+ base-points
+         as-agenda-points
+         (sum-effects state side card :agenda-value nil)))))
 
 (defn advancement-cost-bonus
   "Applies an advancement requirement increase of n the next agenda whose advancement requirement
@@ -598,14 +632,20 @@
   "Adds the given card to the given side's :scored area as an agenda worth n points."
   ([state side card n] (as-agenda state side (make-eid state) card n nil))
   ([state side eid card n] (as-agenda state side eid card n nil))
-  ([state side eid card n {:keys [register-events]}]
-   (move state side (assoc (deactivate state side card) :agendapoints n) :scored)
-   (wait-for (trigger-event-sync state side :as-agenda (assoc card :as-agenda-side side :as-agenda-points n))
-             (do (gain-agenda-point state side n)
-                 (if register-events
-                   (wait-for (card-init state side (find-latest state card) {:resolve-effect false})
-                             (resolve-ability state side eid (:swapped (card-def card)) (find-latest state card) nil))
-                   (effect-completed state side eid))))))
+  ([state side eid card n {:keys [register-events force]}]
+   (let [card (deactivate state side card)
+         card (move state side (assoc card :agendapoints n) :scored {:force force})]
+     (if register-events
+       (wait-for (card-init state side card {:resolve-effect false})
+                 (wait-for (resolve-ability state side (make-eid state eid) (:swapped (card-def card)) card nil)
+                           (wait-for (trigger-event-sync state side :as-agenda (assoc card :as-agenda-side side :as-agenda-points n))
+                                     (update-all-agenda-points state side)
+                                     (check-winner state side)
+                                     (effect-completed state side eid))))
+       (wait-for (trigger-event-sync state side :as-agenda (assoc card :as-agenda-side side :as-agenda-points n))
+                 (update-all-agenda-points state side)
+                 (check-winner state side)
+                 (effect-completed state side eid))))))
 
 (defn forfeit
   "Forfeits the given agenda to the :rfg zone."
@@ -620,18 +660,41 @@
    (let [card (get-card state card)]
      (when (:msg args)
        (system-msg state side (str "forfeits " (:title card))))
-     (gain-agenda-point state side (- (get-agenda-points state side card)))
-     (move state side card :rfg)
-     (wait-for (trigger-event-sync state side (keyword (str (name side) "-forfeit-agenda")) card)
-               (effect-completed state side eid)))))
+     (move state (to-keyword (:side card)) card :rfg)
+     (update-all-agenda-points state side)
+     (check-winner state side)
+     (trigger-event-sync state side eid (keyword (str (name side) "-forfeit-agenda")) card))))
 
-(defn gain-agenda-point
-  "Gain n agenda points and check for winner."
-  [state side n]
-  (gain state side :agenda-point n)
-  (when (and (>= (get-in @state [side :agenda-point]) (get-in @state [side :agenda-point-req]))
-             (not (get-in @state [side :cannot-win-on-points])))
-    (win state side "Agenda")))
+(defn check-winner
+  [state side]
+  (doseq [side [:corp :runner]]
+    (when (and (>= (get-in @state [side :agenda-point]) (get-in @state [side :agenda-point-req]))
+               (not (any-effects state side :cannot-win-on-points)))
+      (win state side "Agenda"))))
+
+(defn update-agenda-points-card
+  [state side card]
+  (update! state side (assoc card :current-points (get-agenda-points state side card))))
+
+(defn sum-agenda-points
+  [state side]
+  (let [user-adjusted-points (sum-effects state side side :user-agenda-points nil)
+        scored-points (->> (get-in @state [side :scored])
+                           (map :current-points)
+                           (reduce + 0))
+        total-points (+ user-adjusted-points scored-points)]
+    (swap! state assoc-in [side :agenda-point] total-points)))
+
+(defn update-agenda-points
+  [state side]
+  (doseq [card (get-in @state [side :scored])]
+    (update-agenda-points-card state side card))
+  (sum-agenda-points state side))
+
+(defn update-all-agenda-points
+  [state side]
+  (doseq [side [:corp :runner]]
+    (update-agenda-points state side)))
 
 
 ;;; Miscellaneous
@@ -651,21 +714,21 @@
 
 (defn mill
   "Force the discard of n cards from the deck by trashing them"
-  ([state side] (mill state side side 1))
-  ([state side n] (mill state side side n))
-  ([state from-side to-side n]
-   (let [milltargets (take n (get-in @state [to-side :deck]))]
-     (doseq [card milltargets]
-       (trash state from-side (make-eid state) card {:unpreventable true})))))
+  ([state side] (mill state side (make-eid state) side 1))
+  ([state side n] (mill state side (make-eid state) side n))
+  ([state from-side to-side n] (mill state from-side (make-eid state) to-side n))
+  ([state from-side eid to-side n]
+   (let [cards (take n (get-in @state [to-side :deck]))]
+     (trash-cards state from-side eid cards {:unpreventable true}))))
 
 (defn discard-from-hand
   "Force the discard of n cards from the hand by trashing them"
-  ([state side] (discard-from-hand state side side 1))
-  ([state side n] (discard-from-hand state side side n))
-  ([state from-side to-side n]
-   (let [milltargets (take n (get-in @state [to-side :hand]))]
-     (doseq [card milltargets]
-       (trash state from-side (make-eid state) card {:unpreventable true})))))
+  ([state side] (discard-from-hand state side (make-eid state) side 1))
+  ([state side n] (discard-from-hand state side (make-eid state) side n))
+  ([state from-side to-side n] (discard-from-hand state from-side (make-eid state) to-side n))
+  ([state from-side eid to-side n]
+   (let [cards (take n (shuffle (get-in @state [to-side :hand])))]
+     (trash-cards state from-side eid cards {:unpreventable true}))))
 
 (defn change-hand-size
   "Changes a side's hand-size modification by specified amount (positive or negative)"

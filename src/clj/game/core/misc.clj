@@ -79,32 +79,40 @@
 (defn same-server?
   "True if the two cards are IN or PROTECTING the same server."
   [card1 card2]
-  (let [zone1 (get-nested-zone card1)
-        zone2 (get-nested-zone card2)]
-    (= (second zone1) (second zone2))))
+  (and card1
+       card2
+       (let [zone1 (get-nested-zone card1)
+             zone2 (get-nested-zone card2)]
+         (= (second zone1) (second zone2)))))
 
 (defn protecting-same-server?
   "True if an ice is protecting the server that the card is in or protecting."
   [card ice]
-  (let [zone1 (get-nested-zone card)
-        zone2 (get-nested-zone ice)]
-    (and (= (second zone1) (second zone2))
-         (= :ices (last zone2)))))
+  (and card
+       ice
+       (let [zone1 (get-nested-zone card)
+             zone2 (get-nested-zone ice)]
+         (and (= (second zone1) (second zone2))
+              (= :ices (last zone2))))))
 
 (defn in-same-server?
   "True if the two cards are installed IN the same server, or hosted on cards IN the same server."
   [card1 card2]
   (let [zone1 (get-nested-zone card1)
         zone2 (get-nested-zone card2)]
-    (and (= zone1 zone2)
+    (and card1
+         card2
+         (= zone1 zone2)
          (is-remote? (second zone1)) ; cards in centrals are in the server's root, not in the server.
          (= :content (last zone1)))))
 
 (defn from-same-server?
   "True if the upgrade is in the root of the server that the target is in."
   [upgrade target]
-  (= (central->zone (:zone target))
-     (butlast (get-nested-zone upgrade))))
+  (and upgrade
+       target
+       (= (central->zone (:zone target))
+          (butlast (get-nested-zone upgrade)))))
 
 (defn all-installed
   "Returns a vector of all installed cards for the given side, including those hosted on other cards,
@@ -218,15 +226,9 @@
 (defn swap-agendas
   "Swaps the two specified agendas, first one scored (on corp side), second one stolen (on runner side)"
   [state side scored stolen]
-  (let [corp-ap-stolen (get-agenda-points state :corp stolen)
-        corp-ap-scored (get-agenda-points state :corp scored)
-        runner-ap-stolen (get-agenda-points state :runner stolen)
-        runner-ap-scored (get-agenda-points state :runner scored)
-        corp-ap-change (- corp-ap-stolen corp-ap-scored)
-        runner-ap-change (- runner-ap-scored runner-ap-stolen)]
-    ;; Remove end of turn events for swapped out agenda
-    (swap! state update-in [:corp :register :end-turn]
-           (fn [events] (remove #(same-card? scored (:card %)) events)))
+  ;; Update location information
+  (let [scored (assoc scored :scored-side :runner)
+        stolen (assoc stolen :scored-side :corp)]
     ;; Move agendas
     (swap! state update-in [:corp :scored]
            (fn [coll] (conj (remove-once #(same-card? % scored) coll) stolen)))
@@ -234,9 +236,6 @@
            (fn [coll] (conj (remove-once #(same-card? % stolen) coll)
                             (if-not (card-flag? scored :has-abilities-when-stolen true)
                               (dissoc scored :abilities :events) scored))))
-    ;; Update agenda points
-    (gain-agenda-point state :runner runner-ap-change)
-    (gain-agenda-point state :corp corp-ap-change)
     ;; Set up abilities and events for new scored agenda
     (let [new-scored (find-cid (:cid stolen) (get-in @state [:corp :scored]))
           abilities (:abilities (card-def new-scored))
@@ -250,7 +249,10 @@
     ;; Set up abilities and events for new stolen agenda
     (when-not (card-flag? scored :has-events-when-stolen true)
       (let [new-stolen (find-cid (:cid scored) (get-in @state [:runner :scored]))]
-        (deactivate state :corp new-stolen)))))
+        (deactivate state :corp new-stolen)))
+    ;; Update agenda points
+    (update-all-agenda-points state side)
+    (check-winner state side)))
 
 (defn remove-old-current
   "Removes the old current when a new one is played, or an agenda is stolen / scored"

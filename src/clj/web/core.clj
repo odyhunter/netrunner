@@ -6,7 +6,6 @@
             [hawk.core :as hawk]
             [monger.collection :as mc]
             [game.core :as core]
-            [game.core.card-defs :refer [reset-card-defs]]
             [game.quotes :as quotes]
             [jinteki.cards :as cards]
             [jinteki.nav :as nav]
@@ -19,7 +18,19 @@
             [web.game :as game]
             [web.lobby :as lobby]
             [web.stats :as stats]
-            [web.ws :as ws])
+            [web.ws :as ws]
+            [game.cards.agendas]
+            [game.cards.assets]
+            [game.cards.basic]
+            [game.cards.events]
+            [game.cards.hardware]
+            [game.cards.ice]
+            [game.cards.identities]
+            [game.cards.operations]
+            [game.cards.programs]
+            [game.cards.resources]
+            [game.cards.upgrades]
+            )
   (:gen-class :main true))
 
 (defonce server (atom nil))
@@ -56,9 +67,6 @@
       (reset! cards/cycles cycles)
       (reset! cards/mwl latest-mwl))
 
-    ;; Reset all of the card implementation definitions
-    (reset-card-defs)
-
     (when (#{"dev" "prod"} (first args))
       (reset! server-mode (first args)))
 
@@ -67,8 +75,8 @@
       (do (mc/create db "config" nil)
           (mc/insert db "config" {:version "0.1.0" :cards-version 0})))
 
-    ;; Clear inactive lobbies after 15 minutes
-    (web.utils/tick #(lobby/clear-inactive-lobbies 900) 1000)
+    ;; Clear inactive lobbies after 30 minutes
+    (web.utils/tick #(lobby/clear-inactive-lobbies 1800) 1000)
     (web.utils/tick lobby/send-lobby 1000)
 
     (reset! server (org.httpkit.server/run-server app {:port port}))

@@ -16,9 +16,9 @@
 (defn find-latest
   "Returns the newest version of a card where-ever it may be"
   [state card]
-  (let [side (-> card :side to-keyword)]
-    (find-cid (:cid card) (concat (all-installed state side)
-                                  (-> (map #(-> @state side %) [:hand :discard :deck :rfg :scored]) concat flatten)))))
+  (find-cid (:cid card) (concat (all-installed state (-> card :side to-keyword))
+                                (-> (map #(-> @state :corp %) [:hand :discard :deck :rfg :scored]) concat flatten)
+                                (-> (map #(-> @state :runner %) [:hand :discard :deck :rfg :scored]) concat flatten))))
 
 (defn get-scoring-owner
   "Returns the owner of the scoring area the card is in"
@@ -70,9 +70,8 @@
                        (trash state side
                               (update-in h [:zone] #(map to-keyword %))
                               {:unpreventable true
-                               :suppress-event true
-                               ;; this handles executives getting trashed before World's Plaza #2949
-                               :host-trashed true})
+                               :host-trashed true
+                               :game-trash true})
                        ())
         update-hosted (fn [h]
                         (let [newz (flatten (list dest))
@@ -104,7 +103,7 @@
             card)
         c (if (and (or installed
                        host
-                       (#{:servers :scored :current} src-zone))
+                       (#{:servers :scored :current :play-area} src-zone))
                    (or (#{:hand :deck :discard :rfg} target-zone)
                        to-facedown)
                    (not (facedown? c)))
@@ -116,6 +115,9 @@
         c (if to-facedown
             (assoc c :facedown true)
             (dissoc c :facedown))
+        c (if (= :scored (first dest))
+            (assoc c :scored-side side)
+            c)
         moved-card (assoc c :zone dest
                             :host nil
                             :hosted hosted
@@ -129,9 +131,14 @@
 
 (defn reset-card
   "Resets a card back to its original state - retaining any data in the :persistent key"
-  ([state side {:keys [title cid persistent]}]
+  ([state side {:keys [cid persistent previous-zone seen title zone]}]
    (swap! state update-in [:per-turn] dissoc cid)
-   (update! state side (assoc (make-card (server-card title) cid) :persistent persistent))))
+   (let [new-card (make-card (server-card title) cid)]
+     (update! state side (assoc new-card
+                                :persistent persistent
+                                :previous-zone previous-zone
+                                :seen seen
+                                :zone zone)))))
 
 (defn move
   "Moves the given card to the given new zone."
@@ -157,26 +164,18 @@
            (let [pos-to-move-to (cond index index
                                       front 0
                                       :else (count (get-in @state (cons side dest))))]
-             (swap! state update-in (cons side dest) #(vec (concat (take pos-to-move-to %) [moved-card] (drop pos-to-move-to %)))))
+             (swap! state update-in (cons side dest) #(into [] (concat (take pos-to-move-to %) [moved-card] (drop pos-to-move-to %)))))
+           (swap! state update-in (cons side dest)
+                  #(into [] (map-indexed (fn [idx card] (assoc card :index idx)) %)))
            (let [z (vec (cons :corp (butlast zone)))]
              (when (and (not keep-server-alive)
                         (is-remote? z)
                         (empty? (get-in @state (conj z :content)))
                         (empty? (get-in @state (conj z :ices))))
-               (when-let [run (:run @state)]
-                 (when (= (last (:server run)) (last z))
-                   (handle-end-run state side)))
                (swap! state dissoc-in z)))
            (when-let [move-zone-fn (:move-zone (card-def moved-card))]
              (move-zone-fn state side (make-eid state) moved-card card))
            (trigger-event state side :card-moved card (assoc moved-card :move-to-side side))
-           (when-let [zone (or (#{:discard :hand :deck} src-zone)
-                               (#{:discard :hand :deck} to))]
-             (let [event (keyword (str (name side) "-" (name zone) "-change"))]
-               ; To easily grep:
-               ; :corp-hand-change :corp-deck-change :corp-discard-change
-               ; :runner-hand-change :runner-deck-change :runner-discard-change
-               (trigger-event-sync state side (make-eid state) event (count (get-in @state [side zone])) moved-card)))
            ; This is for removing `:location :X` events that are non-default locations,
            ; such as Subliminal Messaging only registering in :discard. We first unregister
            ; any non-default events from the previous zone and the register the non-default
@@ -194,12 +193,9 @@
              (when (seq events)
                (register-events state side moved-card events)))
            ;; Default a card when moved to inactive zones (except :persistent key)
-           (when (#{:discard :hand :deck :rfg :scored} to)
-             (reset-card state side moved-card)
-             (when-let [icon-card (get-in moved-card [:icon :card])]
-               ;; Remove icon and icon-card keys
-               (remove-icon state side icon-card moved-card)))
-           moved-card))))))
+           (when (#{:discard :hand :deck :rfg} to)
+             (reset-card state side moved-card))
+           (get-card state moved-card)))))))
 
 (defn move-zone
   "Moves all cards from one zone to another, as in Chronos Project."
@@ -249,7 +245,9 @@
 (defn shuffle!
   "Shuffles the vector in @state [side kw]."
   [state side kw]
-  (wait-for (trigger-event-sync state side (if (= :corp side) :corp-shuffle-deck :runner-shuffle-deck) nil)
+  (wait-for (trigger-event-sync state side (when (= :deck kw)
+                                             (if (= :corp side) :corp-shuffle-deck :runner-shuffle-deck))
+                                nil)
             (swap! state update-in [side kw] shuffle)))
 
 (defn shuffle-into-deck

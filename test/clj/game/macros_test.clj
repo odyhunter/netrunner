@@ -1,10 +1,10 @@
-(ns game-test.macros
+(ns game.macros-test
   (:require [game.core :as core]
             [game.core.card :refer [get-card]]
             [game.utils :refer [side-str]]
             [clojure.test :refer :all]
             [clojure.string :refer [join]]
-            [game-test.utils :refer :all]
+            [game.utils-test :refer :all]
             [jinteki.utils :as jutils]))
 
 (defmacro do-game [s & body]
@@ -20,7 +20,9 @@
                        ;; (is ~'ret "(refresh card) is nil - if this is intended, use (core/get-card state card)")
                        ~'ret))
          ~'prompt-map (fn [side#] (-> @~'state side# :prompt first))
-         ~'prompt-titles (fn [side#] (map :title (:choices (~'prompt-map side#))))
+         ~'prompt-type (fn [side#] (:prompt-type (~'prompt-map side#)))
+         ~'prompt-buttons (fn [side#] (->> (~'prompt-map side#) :choices (map :value)))
+         ~'prompt-titles (fn [side#] (map :title (~'prompt-buttons side#)))
          ~'prompt-fmt (fn [side#]
                         (let [prompt# (~'prompt-map side#)
                               choices# (:choices prompt#)
@@ -31,7 +33,10 @@
                               prompt-type# (:prompt-type prompt#)]
                           (str (side-str side#) ": " (:msg prompt# "") "\n"
                                "Type: " (if (some? prompt-type#) prompt-type# "nil") "\n"
-                               (join "\n" (map #(str "[ " (or (:title %) % "nil") " ]") choices#)) "\n")))]
+                               (join "\n" (map #(str "[ " (or (get-in % [:value :title])
+                                                              (:value %)
+                                                              %
+                                                              "nil") " ]") choices#)) "\n")))]
      ~@body))
 
 (defmacro deftest-pending [name & body]

@@ -183,6 +183,7 @@
       :trash-resource-from-hand (<= 0 (- (count (filter resource? (get-in @state [:runner :hand]))) amount))
       :trash-entire-hand true
       :shuffle-installed-to-stack (<= 0 (- (count (all-installed state :runner)) amount))
+      :add-installed-to-bottom-of-deck (<= 0 (- (count (all-installed state side)) amount))
       :any-agenda-counter (<= 0 (- (reduce + (map #(get-counters % :agenda) (get-in @state [:corp :scored]))) amount))
       (:advancement :agenda :power :virus) (<= 0 (- (get-counters card cost-type) amount))
       :any-virus-counter (or (<= 0 (- (get-counters card :virus) amount))
@@ -243,6 +244,7 @@
       :trash-resource-from-hand (str "trash " (quantify amount "resource") " in your hand")
       (:net :meat :brain) (str "suffer " (quantify amount (str (name cost-type) " damage") ""))
       :shuffle-installed-to-stack (str "shuffle " (quantify amount "installed card") " into the stack")
+      :add-installed-to-bottom-of-deck (str "add " (quantify amount "installed card") " to the bottom of the stack")
       :any-agenda-counter "any agenda counter"
       :any-virus-counter (str "any " (quantify amount "virus counter"))
       (:advancement :agenda :power :virus) (if (< 1 amount)
@@ -350,11 +352,11 @@
       ;; do not create an undo state if click is being spent due to a steal cost (eg. Ikawah Project)
       (swap! state assoc :click-state (dissoc @state :log)))
     (lose state side :click amount)
-    (trigger-event state side
-                   (if (= side :corp) :corp-spent-click :runner-spent-click)
-                   a (:click (into {} costs)))
-    (swap! state assoc-in [side :register :spent-click] true)
-    (complete-with-result state side eid (str "spends " (->> "[Click]" repeat (take amount) (apply str))))))
+    (wait-for (trigger-event-sync state side (make-eid state eid)
+                                  (if (= side :corp) :corp-spent-click :runner-spent-click)
+                                  a (:click (into {} costs)))
+              (swap! state assoc-in [side :register :spent-click] true)
+              (complete-with-result state side eid (str "spends " (->> "[Click]" repeat (take amount) (apply str)))))))
 
 (defn pay-trash
   "[Trash] cost as part of an ability"
@@ -441,7 +443,6 @@
                                 :max amount
                                 :card select-fn}
                       :async true
-                      :priority 11
                       :effect (req (wait-for (trash-cards state side targets (merge args {:unpreventable true}))
                                              (complete-with-result
                                                state side eid
@@ -471,9 +472,10 @@
   [state side eid amount]
   (let [select-fn #(and ((if (= :corp side) corp? runner?) %)
                         (in-hand? %))
+        prompt-hand (if (= :corp side) "HQ" "your grip")
         hand (if (= :corp side) "HQ" "their grip")]
     (continue-ability state side
-                      {:prompt (str "Choose " (quantify amount (str "card in " hand)) " to trash")
+                      {:prompt (str "Choose " (quantify amount "card") " in " prompt-hand " to trash")
                        :choices {:all true
                                  :max amount
                                  :card select-fn}
@@ -513,7 +515,6 @@
   (continue-ability
     state side
     {:prompt (str "Choose a " card-type " to trash from your grip")
-     :priority 11
      :async true
      :choices {:all true
                :max amount
@@ -546,6 +547,29 @@
                                          " (" (join ", " (map :title targets)) ")"
                                          " into their stack")))}
                     nil nil))
+
+(defn pay-move-installed-to-deck
+  "Trash a card as part of paying for a card or ability"
+  ([state side eid card-type amount select-fn] (pay-move-installed-to-deck state side eid card-type amount select-fn nil))
+  ([state side eid card-type amount select-fn args]
+   (let [args (merge {:front true} args)
+         location (if (:front args) "top" "bottom")
+         deck (if (= :corp side) "R&D" "the stack")]
+     (continue-ability state side
+                       {:prompt (str "Choose " (quantify amount (if card-type card-type "card") ) " to move to the " location " of " deck)
+                        :choices {:all true
+                                  :max amount
+                                  :card select-fn}
+                        :async true
+                        :effect (req (doseq [c targets]
+                                       (move state side target :deck (select-keys args [:front])))
+                                     (complete-with-result
+                                       state side eid
+                                       (str "adds " (quantify amount (or (:plural args) card-type))
+                                            " to the " location
+                                            " of " deck
+                                            " (" (join ", " (map #(card-str state %) targets)) ")")))}
+                       nil nil))))
 
 (defn pay-any-agenda-counter
   [state side eid amount]
@@ -641,6 +665,12 @@
 
      ;; Shuffle installed runner cards into the stack (eg Degree Mill)
      :shuffle-installed-to-stack (pay-shuffle-installed-to-stack state side eid amount)
+
+     ;; Move installed cards to the deck
+     :add-installed-to-bottom-of-deck
+     (pay-move-installed-to-deck state side eid nil amount
+                                 (every-pred installed?)
+                                 {:front false})
 
      ;; Spend a counter on another card
      :any-agenda-counter (pay-any-agenda-counter state side eid amount)
@@ -767,7 +797,7 @@
 
 (defn ignore-install-cost?
   [state side card]
-  (some true? (get-effects state side card :ignore-install-cost)))
+  (any-effects state side :ignore-install-cost true? card))
 
 (defn run-cost
   "Get a list of all costs required to run a server."
@@ -784,3 +814,36 @@
   ([state side card & targets]
    (merge-costs
      (get-effects state side card :run-additional-cost targets))))
+
+(defn has-trash-ability?
+  [card]
+  (let [abilities (:abilities (card-def card))
+        events (:events (card-def card))]
+    (or (some :trash-icon (concat abilities events))
+        (some #(= :trash (first %))
+              (->> abilities
+                   (map :cost)
+                   (map merge-costs)
+                   (apply concat))))))
+
+(defn card-ability-cost
+  "Returns a list of all costs (printed and additional) required to use a given ability"
+  ([state side ability card] (card-ability-cost state side ability card nil nil))
+  ([state side ability card targets] (card-ability-cost state side ability card targets nil))
+  ([state side ability card targets {:keys [cost-bonus] :as args}]
+   (concat (:cost ability)
+           (:additional-cost ability)
+           (get-effects state side card :card-ability-additional-cost (flatten [ability targets])))))
+
+(defn break-sub-ability-cost
+  ([state side ability card] (break-sub-ability-cost state side ability card nil nil))
+  ([state side ability card targets] (break-sub-ability-cost state side ability card targets nil))
+  ([state side ability card targets {:keys [cost-bonus] :as args}]
+   (concat (:cost ability)
+           (:additional-cost ability)
+           (get-effects state side card :break-sub-additional-cost (flatten [ability targets])))))
+
+(defn jack-out-cost
+  ([state side] (jack-out-cost state side nil))
+  ([state side args]
+   (get-effects state side nil :jack-out-additional-cost args)))

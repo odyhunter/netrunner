@@ -985,7 +985,6 @@ nav ul
       text-overflow: ellipsis
       white-space: nowrap
       overflow: hidden
-      width: 260px
 
     > img
       float: left
@@ -1416,6 +1415,9 @@ nav ul
   .card.selected
     box-shadow(0 0 1px 2px limegreen)
 
+  .card.hovered
+    box-shadow(0 0 1px 2px cyan)
+
   .counters
     position: absolute
     top: 0
@@ -1513,7 +1515,7 @@ nav ul
     right: 3px
     padding-left: 3px
     padding-right: 3px
-    white-space: nowrap
+    // white-space: nowrap
 
   .server-target
     background-color: sienna
@@ -2078,15 +2080,18 @@ nav ul
       margin-top: 5px
       margin-right: 5px
       position: relative
-      transition(all 0.2s ease-in-out)
+      transition(opacity 0.2s ease-in-out)
+      opacity: 0
 
       .card-preview
         width: 100%
         height: 100%
-        transition(all 0.2s ease-in-out)
 
         .text
           height: 195px
+
+    .card-zoom.fade
+      opacity: 1
 
     // Card implementation div
     .implementation
@@ -2097,7 +2102,6 @@ nav ul
       text-align: right
       font-size: 12px
       line-height: 12px
-      transition(all 0.2s ease-in-out)
 
       .unimplemented
         color: red
@@ -2131,7 +2135,7 @@ nav ul
         -webkit-overflow-scrolling: touch
         position: absolute
         top: 0
-        bottom: 43px
+        bottom: 70px
         left: 0
         right: 4px
         margin: 0
@@ -2139,14 +2143,14 @@ nav ul
         div
           animation: fadein 0.5s
 
-      > form
+      > div
         position: absolute
         bottom: 12px
         left: 0
         right: 4px
 
-        input
-          width: 100%
+        > form input
+            width: 100%
 
 #help
   position: absolute

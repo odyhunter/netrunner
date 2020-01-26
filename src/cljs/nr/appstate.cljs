@@ -14,9 +14,15 @@
            :options (merge {:background "lobby-bg"
                             :show-alt-art true
                             :stacked-servers (= (get-local-value "stacked-servers" "true") "true")
-                            :runner-board-order (= (get-local-value "runner-board-order" "true") "true")
+                            :runner-board-order (let [value (get-local-value "runner-board-order" "irl")]
+                                                  (case value
+                                                    "true" "jnet"
+                                                    "false" "irl"
+                                                    value))
                             :deckstats "always"
                             :gamestats "always"
+                            :log-width (str->int (get-local-value "log-width" "300"))
+                            :log-top (str->int (get-local-value "log-top" "419"))
                             :sounds (= (get-local-value "sounds" "true") "true")
                             :lobby-sounds (= (get-local-value "lobby_sounds" "true") "true")
                             :sounds-volume (str->int (get-local-value "sounds_volume" "100"))}

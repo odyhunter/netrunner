@@ -2,7 +2,7 @@
 
 (declare can-trigger? event-title
          register-suppress resolve-ability
-         trigger-suppress unregister-suppress)
+         unregister-suppress)
 
 (defn default-locations
   [card]
@@ -26,13 +26,15 @@
                  :location (or (:location ability) (default-locations card))
                  :duration (or (:duration ability) :while-installed)
                  :condition (or (:condition ability) :active)
+                 :unregister-once-resolved (or (:unregister-once-resolved ability) false)
                  :ability (dissoc ability :event :duration :condition)
                  :card card
                  :uuid (uuid/v1)})
               (into []))]
      (when (seq abilities)
-       (swap! state update :events #(apply conj % abilities))))
-   (register-suppress state side card)))
+       (swap! state update :events #(apply conj % abilities)))
+     (register-suppress state side card)
+     abilities)))
 
 (defn unregister-events
   "Removes all event handlers defined for the given card.
@@ -70,6 +72,55 @@
               (remove #(and (same-card? card (:card %))
                             (= duration (:duration %))))
               (into []))))
+
+(defn unregister-event-by-uuid
+  "Removes a single event handler with matching uuid"
+  [state side uuid]
+  (swap! state assoc :events (remove-once #(= uuid (:uuid %)) (:events @state))))
+
+; Functions for registering trigger suppression events.
+(defn register-suppress
+  "Registers each suppression handler in the given card definition. Suppression handlers
+  can prevent the dispatching of a particular event."
+  ([state side card] (register-suppress state side card (:suppress (card-def card))))
+  ([state side card events]
+   (when events
+     (let [abilities
+           (->> (for [ability events]
+                  {:event (:event ability)
+                   :ability (dissoc ability :event)
+                   :card card
+                   :uuid (uuid/v1)})
+                (into []))]
+       (when (seq abilities)
+         (swap! state update :suppress #(apply conj % abilities)))
+       abilities))))
+
+(defn unregister-suppress
+  "Removes all event handler suppression effects as defined for the given card"
+  ([state side card] (unregister-suppress state side card (:suppress (card-def card))))
+  ([state side card events]
+   (let [abilities (map :event events)]
+     (swap! state assoc :suppress
+            (->> (:suppress @state)
+                 (remove #(and (same-card? card (:card %))
+                               (in-coll? abilities (:event %))))
+                 (into []))))))
+
+(defn unregister-suppress-by-uuid
+  "Removes a single event handler with matching uuid"
+  [state side uuid]
+  (swap! state assoc :suppress (remove-once #(= uuid (:uuid %)) (:suppress @state))))
+
+(declare card-for-ability)
+
+(defn trigger-suppress
+  "Returns true if the given event on the given targets should be suppressed, by triggering
+  each suppression handler and returning true if any suppression handler returns true."
+  [state side event & targets]
+  (->> (:suppress @state)
+       (filter #(= event (:event %)))
+       (some #((:req (:ability %)) state side (make-eid state) (card-for-ability state %) targets))))
 
 ;; triggering events
 (defn- get-side
@@ -135,13 +186,17 @@
           handlers (gather-events state side event targets)]
       (doseq [to-resolve handlers]
         (when-let [card (card-for-ability state to-resolve)]
-          (resolve-ability state side (dissoc (:ability to-resolve) :req) card targets))))))
+          (resolve-ability state side (dissoc (:ability to-resolve) :req) card targets)
+          (when (:unregister-once-resolved to-resolve)
+            (unregister-event-by-uuid state side (:uuid to-resolve))))))))
 
 (defn- trigger-event-sync-next
   [state side eid handlers event targets]
   (if-let [to-resolve (first handlers)]
     (if-let [card (card-for-ability state to-resolve)]
-      (wait-for (resolve-ability state side (dissoc (:ability to-resolve) :req) card targets)
+      (wait-for (resolve-ability state side (make-eid state eid) (dissoc (:ability to-resolve) :req) card targets)
+                (when (:unregister-once-resolved to-resolve)
+                  (unregister-event-by-uuid state side (:uuid to-resolve)))
                 (trigger-event-sync-next state side eid (rest handlers) event targets))
       (trigger-event-sync-next state side eid (rest handlers) event targets))
     (effect-completed state side eid)))
@@ -156,7 +211,7 @@
         (let [get-side #(-> % :card :side game.utils/to-keyword)
               is-active-player #(= (:active-player @state) (get-side %))
               handlers (gather-events state side event targets)]
-          (wait-for (trigger-event-sync-next state side handlers event targets)
+          (wait-for (trigger-event-sync-next state side (make-eid state eid) handlers event targets)
                     (effect-completed state side eid))))))
 
 (defn- trigger-event-simult-player
@@ -173,12 +228,13 @@
               (and (< 1 (count handlers))
                    (not (and cancel-fn (cancel-fn state)))))
             (choose-handler [handlers]
-              (let [handlers (filter #(card-for-ability state %) handlers)
+              (let [handlers (when-not (and cancel-fn (cancel-fn state))
+                               (filter #(card-for-ability state %) handlers))
                     non-silent (filter #(let [silent-fn (:silent (:ability %))]
                                           (not (and silent-fn
                                                     (silent-fn state side (make-eid state) (:card %) event-targets))))
                                        handlers)
-                    titles (map (comp :title :card) non-silent)
+                    titles (map :card non-silent)
                     interactive (filter #(let [interactive-fn (:interactive (:ability %))]
                                            (and interactive-fn
                                                 (interactive-fn state side (make-eid state) (:card %) event-targets)))
@@ -197,6 +253,8 @@
                        :effect (req (wait-for (resolve-ability state (to-keyword (:side the-card))
                                                                ability-to-resolve
                                                                the-card event-targets)
+                                              (when (:unregister-once-resolved to-resolve)
+                                                (unregister-event-by-uuid state side (:uuid to-resolve)))
                                               (if (should-continue state handlers)
                                                 (continue-ability state side
                                                                   (choose-handler others) nil event-targets)
@@ -208,16 +266,18 @@
                   {:prompt "Choose a trigger to resolve"
                    :choices titles
                    :async true
-                   :effect (req (let [to-resolve (some #(when (= target (:title (:card %))) %) handlers)
+                   :effect (req (let [to-resolve (some #(when (same-card? target (:card %)) %) handlers)
                                       ability-to-resolve (dissoc (:ability to-resolve) :req)
                                       the-card (card-for-ability state to-resolve)]
                                   (wait-for
                                     (resolve-ability state (to-keyword (:side the-card))
                                                      ability-to-resolve the-card event-targets)
+                                    (when (:unregister-once-resolved to-resolve)
+                                      (unregister-event-by-uuid state side (:uuid to-resolve)))
                                     (if (should-continue state handlers)
                                       (continue-ability state side
                                                         (choose-handler
-                                                          (remove-once #(= target (:title (:card %))) handlers))
+                                                          (remove-once #(same-card? target (:card %)) handlers))
                                                         nil event-targets)
                                       (effect-completed state side eid)))))})))]
 
@@ -296,43 +356,7 @@
                                         (clear-wait-prompt state active-player)
                                         (effect-completed state side eid))))))))
 
-
-; Functions for registering trigger suppression events.
-(defn register-suppress
-  "Registers each suppression handler in the given card definition. Suppression handlers
-  can prevent the dispatching of a particular event."
-  ([state side card] (register-suppress state side card (:suppress (card-def card))))
-  ([state side card events]
-   (when events
-     (let [abilities
-           (->> (for [ability events]
-                  {:event (:event ability)
-                   :ability (dissoc ability :event)
-                   :card card
-                   :uuid (uuid/v1)})
-                (into []))]
-       (swap! state update :suppress
-              #(apply conj % abilities))))))
-
-(defn unregister-suppress
-  "Removes all event handler suppression effects as defined for the given card"
-  ([state side card] (unregister-suppress state side card (:suppress (card-def card))))
-  ([state side card events]
-   (let [abilities (map :event events)]
-     (swap! state assoc :suppress
-            (->> (:suppress @state)
-                 (remove #(and (same-card? card (:card %))
-                               (in-coll? abilities (:event %))))
-                 (into []))))))
-
-(defn trigger-suppress
-  "Returns true if the given event on the given targets should be suppressed, by triggering
-  each suppression handler and returning true if any suppression handler returns true."
-  [state side event & targets]
-  (->> (:suppress @state)
-       (filter #(= event (:event %)))
-       (some #((:req (:ability %)) state side (make-eid state) (:card %) targets))))
-
+;; Functions for event parsing
 (defn turn-events
   "Returns the targets vectors of each event with the given key that was triggered this turn."
   [state side ev]
@@ -377,7 +401,7 @@
 
 (defn second-event?
   "Returns true if the given event has occurred twice this turn.
-  Includese itself if this is checked in the requirement for an event ability.
+  Includes itself if this is checked in the requirement for an event ability.
   Filters on events satisfying (pred targets) if given pred."
   ([state side ev] (second-event? state side ev (constantly true)))
   ([state side ev pred]
@@ -387,6 +411,16 @@
   "Returns true if the active run is the first succesful run on the given server"
   [state server]
   (first-event? state :runner :successful-run #(= [server] %)))
+
+(defn first-trash?
+  "Returns true if cards have been trashed by either player only once this turn.
+  Includes itself if this is checked in the requirement for an event ability.
+  Filters on trash events satisfying (pred targets) if given pred.
+  Note that trash event targets may be optionally followed by a reason for the trash, or nil."
+  ([state] (first-trash? state (constantly true)))
+  ([state pred]
+   (= 1 (+ (event-count state nil :runner-trash pred)
+           (event-count state nil :corp-trash pred)))))
 
 (defn get-turn-damage
   "Returns the value of damage take this turn"

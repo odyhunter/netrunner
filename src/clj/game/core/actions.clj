@@ -3,12 +3,13 @@
 ;; These functions are called by main.clj in response to commands sent by users.
 
 (declare available-mu card-str can-rez? can-advance? corp-install effect-as-handler
-         enforce-msg gain-agenda-point get-remote-names get-run-ices jack-out move
+         enforce-msg get-remote-names get-run-ices jack-out move
          name-zone play-instant purge make-run runner-install trash get-strength
          update-breaker-strength update-ice-in-server update-run-ice win can-run?
          can-run-server? can-score? say play-sfx base-mod-size free-mu total-run-cost
          reset-all-subs! resolve-subroutine! resolve-unbroken-subs! break-subroutine!
-         update-all-ice update-all-icebreakers)
+         update-all-ice update-all-icebreakers continue play-ability
+         installable-servers get-runnable-zones)
 
 ;;; Neutral actions
 (defn play
@@ -16,12 +17,8 @@
   [state side {:keys [card server]}]
   (when-let [card (get-card state card)]
     (case (:type card)
-      ("Event" "Operation") (play-instant state side (make-eid state {:source :action
-                                                                      :source-type :play}) card {:base-cost [:click 1]})
-      ("Hardware" "Resource" "Program") (runner-install state side (make-eid state {:source :action
-                                                                                    :source-type :runner-install}) card {:base-cost [:click 1]})
-      ("ICE" "Upgrade" "Asset" "Agenda") (corp-install state side (make-eid state {:source server
-                                                                                   :source-type :corp-install}) card server {:base-cost [:click 1] :action :corp-click-install}))))
+      ("Event" "Operation") (play-ability state side {:card (get-in @state [side :basic-action-card]) :ability 3 :targets [card]})
+      ("Hardware" "Resource" "Program" "ICE" "Upgrade" "Asset" "Agenda") (play-ability state side {:card (get-in @state [side :basic-action-card]) :ability 2 :targets [card server]}))))
 
 (defn shuffle-deck
   "Shuffle R&D/Stack."
@@ -36,24 +33,12 @@
 (defn click-draw
   "Click to draw."
   [state side args]
-  (when (and (not (get-in @state [side :register :cannot-draw]))
-             (pay state side nil :click 1 {:action :corp-click-draw}))
-    (system-msg state side "spends [Click] to draw a card")
-    (wait-for (trigger-event-simult state side (if (= side :corp) :pre-corp-click-draw :pre-runner-click-draw) nil nil)
-              (trigger-event state side (if (= side :corp) :corp-click-draw :runner-click-draw) (->> @state side :deck (take 1)))
-              (draw state side)
-              (swap! state update-in [:stats side :click :draw] (fnil inc 0))
-              (play-sfx state side "click-card"))))
+  (play-ability state side {:card (get-in @state [side :basic-action-card]) :ability 1}))
 
 (defn click-credit
   "Click to gain 1 credit."
   [state side args]
-  (when (pay state side nil :click 1 {:action :corp-click-credit})
-    (system-msg state side "spends [Click] to gain 1 [Credits]")
-    (gain-credits state side 1 (if (= :corp side) :corp-click-credit :runner-click-credit))
-    (swap! state update-in [:stats side :click :credit] (fnil inc 0))
-    (trigger-event state side (if (= side :corp) :corp-click-credit :runner-click-credit))
-    (play-sfx state side "click-credit")))
+  (play-ability state side {:card (get-in @state [side :basic-action-card]) :ability 0}))
 
 (defn- change-msg
   "Send a system message indicating the property change"
@@ -99,6 +84,25 @@
               (str "sets Bad Publicity to " (get-in @state [:corp :bad-publicity :base])
                    " (" (if (pos? delta) (str "+" delta) delta) ")")))
 
+(defn- change-agenda-points
+  "Change a player's total agenda points. This is done through registering an agenda
+  point effect that's only used when tallying total agenda points. Instead of adding or
+  removing these effects, we allow for creating as many as needed to properly adjust
+  the total."
+  [state side delta]
+  (register-floating-effect
+    state side nil
+    ;; This is needed as `req` creates/shadows the existing `side` already in scope.
+    (let [user-side side]
+      {:type :user-agenda-points
+       ;; `target` is either `:corp` or `:runner`
+       :req (req (= user-side target))
+       :value delta}))
+  (update-all-agenda-points state side)
+  (system-msg state side
+              (str "sets their agenda points to " (get-in @state [side :agenda-point])
+                   " (" (if (pos? delta) (str "+" delta) delta) ")")))
+
 (defn- change-generic
   "Change a player's base generic property."
   [state side key delta]
@@ -115,6 +119,7 @@
     :hand-size (change-map state side key delta)
     :tag (change-tags state delta)
     :bad-publicity (change-bad-pub state delta)
+    :agenda-point (change-agenda-points state side delta)
     ; else
     (change-generic state side key delta)))
 
@@ -182,55 +187,41 @@
 (defn- finish-prompt [state side prompt card]
   (when-let [end-effect (:end-effect prompt)]
     (end-effect state side (make-eid state) card nil))
-  ;; remove the prompt from the queue
-  (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % prompt) pr)))
-  ;; This is a dirty hack to end the run when the last access prompt is resolved.
-  (when (empty? (get-in @state [:runner :prompt]))
-    (when-let [run (:run @state)]
-      (when (:ended run)
-        (handle-end-run state :runner)))
-    (swap! state dissoc :access))
   true)
+
+(defn- prompt-error
+  [context prompt prompt-args]
+  (.println *err* (with-out-str (clojure.stacktrace/print-stack-trace
+                                  (Exception. (str "Error " context)))))
+  (.println *err* (str "Prompt: " prompt))
+  (.println *err* (str "Prompt args: " prompt-args)))
 
 (defn resolve-prompt
   "Resolves a prompt by invoking its effect function with the selected target of the prompt.
   Triggered by a selection of a prompt choice button in the UI."
-  [state side {:keys [choice card] :as args}]
-  (let [servercard (get-card state card)
-        card (if (not= (:title card) (:title servercard))
-               (server-card (:title card))
-               servercard)
-        prompt (first (get-in @state [side :prompt]))
+  [state side {:keys [choice] :as args}]
+  (let [prompt (first (get-in @state [side :prompt]))
+        effect (:effect prompt)
+        card (get-card state (:card prompt))
         choices (:choices prompt)]
     (cond
-      ;; Shortcut
-      (= choice "Cancel")
-      (do (if-let [cancel-effect (:cancel-effect prompt)]
-            ;; trigger the cancel effect
-            (cancel-effect choice)
-            (effect-completed state side (:eid prompt)))
-          (finish-prompt state side prompt card))
-
       ;; Integer prompts
       (or (= choices :credit)
           (= :trace (:prompt-type prompt))
           (:counter choices)
           (:number choices))
       (if (number? choice)
-        (do (when (= choices :credit) ; :credit prompts require payment
+        (do (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % prompt) pr)))
+            (when (= choices :credit) ; :credit prompts require payment
               (pay state side card :credit (min choice (get-in @state [side :credit]))))
             (when (:counter choices)
               ;; :Counter prompts deduct counters from the card
-              (add-counter state side (:card prompt) (:counter choices) (- choice)))
+              (add-counter state side card (:counter choices) (- choice)))
             ;; trigger the prompt's effect function
-            (when-let [effect-prompt (:effect prompt)]
-              (effect-prompt (or choice card)))
+            (when effect
+              (effect (or choice card)))
             (finish-prompt state side prompt card))
-        (do
-          (.println *err* (with-out-str
-                            (clojure.stacktrace/print-stack-trace
-                              (Exception. "Error in an integer prompt") 25)))
-          (.println *err* (str "Current prompt: " prompt))))
+        (prompt-error "in an integer prompt" prompt args))
 
       ;; List of card titles for auto-completion
       (:card-title choices)
@@ -238,75 +229,74 @@
         (let [title-fn (:card-title choices)
               found (some #(when (= (lower-case choice) (lower-case (:title % ""))) %) (server-cards))]
           (if found
-            (if (title-fn state side (make-eid state) (:card prompt) [found])
-              (do (when-let [effect-prompt (:effect prompt)]
-                    (effect-prompt (or choice card)))
+            (if (title-fn state side (make-eid state) card [found])
+              (do (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % prompt) pr)))
+                  (when effect
+                    (effect (or choice card)))
                   (finish-prompt state side prompt card))
               (toast state side (str "You cannot choose " choice " for this effect.") "warning"))
             (toast state side (str "Could not find a card named " choice ".") "warning")))
-        (do
-          (.println *err* (with-out-str
-                            (clojure.stacktrace/print-stack-trace
-                              (Exception. "Error in a card-title prompt") 25)))
-          (.println *err* (str "Current prompt: " prompt))))
+        (prompt-error "in a card-title prompt" prompt args))
 
-      ;; Default text prompt
+      ;; Otherwise, choices is a sequence of strings and/or cards
+      ;; choice is a string and should match one of the strings, or the title of one of the cards
+      (:uuid choice)
+      (let [uuid (uuid/as-uuid (:uuid choice))
+            match (first (filter #(= uuid (:uuid %)) choices))]
+        (when match
+          ;; remove the prompt from the queue
+          (swap! state update-in [side :prompt] (fn [pr] (filter #(not= % prompt) pr)))
+          (if (= (:value match) "Cancel")
+            (do (if-let [cancel-effect (:cancel-effect prompt)]
+                  ;; trigger the cancel effect
+                  (cancel-effect choice)
+                  (effect-completed state side (:eid prompt)))
+                (finish-prompt state side prompt card))
+            (do (effect (:value match))
+                (finish-prompt state side prompt card)))))
+
       :else
-      (let [buttons (filter #(or (= choice %)
-                                 (= card %)
-                                 (let [choice-str (if (string? choice)
-                                                    (lower-case choice)
-                                                    (lower-case (:title choice "do-not-match")))]
-                                   (or (= choice-str (lower-case %))
-                                       (= choice-str (lower-case (:title % ""))))))
-                            choices)
-            button (first buttons)]
-        (if button
-          (do (when-let [effect-prompt (:effect prompt)]
-                (effect-prompt button))
-              (finish-prompt state side prompt card))
-          (do
-            (.println *err* (with-out-str
-                              (clojure.stacktrace/print-stack-trace
-                                (Exception. "Error in a text prompt") 25)))
-            (.println *err* (str "Current prompt: " prompt))
-            (.println *err* (str "Current args: " args))))))))
+      (prompt-error "in an unknown prompt type" prompt args))))
 
 (defn select
   "Attempt to select the given card to satisfy the current select prompt. Calls resolve-select
   if the max number of cards has been selected."
   [state side {:keys [card] :as args}]
-  (let [card (get-card state card)
+  (let [target (get-card state card)
         prompt (first (get-in @state [side :selected]))
         ability (:ability prompt)
         card-req (:req prompt)
         card-condition (:card prompt)
         cid (:not-self prompt)]
-    (when (and (not= (:cid card) cid)
+    (when (and (not= (:cid target) cid)
                (cond
-                 card-condition (card-condition card)
-                 card-req (card-req state side (:eid ability) (:card ability) [card])
+                 card-condition (card-condition target)
+                 card-req (card-req state side (:eid ability) (get-card state (:card ability)) [target])
                  :else true))
-      (let [c (update-in card [:selected] not)]
+      (let [c (update-in target [:selected] not)]
         (update! state side c)
         (if (:selected c)
           (swap! state update-in [side :selected 0 :cards] #(conj % c))
           (swap! state update-in [side :selected 0 :cards]
-                 (fn [coll] (remove-once #(same-card? % card) coll))))
-        (let [selected (get-in @state [side :selected 0])]
+                 (fn [coll] (remove-once #(same-card? % target) coll))))
+        (let [selected (get-in @state [side :selected 0])
+              prompt (first (get-in @state [side :prompt]))
+              card (:card prompt)]
           (when (= (count (:cards selected)) (or (:max selected) 1))
-            (resolve-select state side update! resolve-ability)))))))
+            (resolve-select state side card (select-keys prompt [:cancel-effect]) update! resolve-ability)))))))
 
-(defn- do-play-ability [state side card ability targets]
-  (let [cost (:cost ability)
-        cost-to-run (when (has-subtype? card "Run")
-                      (total-run-cost state side card))]
-    (when (or (and (nil? cost)
-                   (nil? cost-to-run))
-              (can-pay? state side (make-eid state {:source card :source-type :ability}) card (:title card) cost cost-to-run))
+(declare check-for-empty-server handle-end-run)
+
+(defn- do-play-ability [state side card ability ability-idx targets]
+  (let [cost (card-ability-cost state side ability card targets)]
+    (when (or (nil? cost)
+              (can-pay? state side (make-eid state {:source card :source-type :ability :source-info {:ability-idx ability-idx}}) card (:title card) cost))
       (when-let [activatemsg (:activatemsg ability)]
         (system-msg state side activatemsg))
-      (resolve-ability state side ability card targets))))
+      (let [eid (make-eid state {:source card :source-type :ability :source-info {:ability-idx ability-idx}})]
+        (wait-for (resolve-ability state side eid (assoc ability :cost cost) card targets)
+                  (when (check-for-empty-server state)
+                    (handle-end-run state side)))))))
 
 (defn play-ability
   "Triggers a card's ability using its zero-based index into the card's card-def :abilities vector."
@@ -321,12 +311,12 @@
               :async true
               :effect (req (add-prop state side card :rec-counter -1)
                            (gain state side :credit 1)
-                           (let [event (when (has-subtype? card "Stealth")
-                                         :spent-stealth-credit)]
-                             (trigger-event-sync state side eid event card)))}
-             (get-in cdef [:abilities ability]))]
-    (when-not (:disabled card)
-      (do-play-ability state side card ab targets))))
+                           (trigger-event-sync state side eid :spent-credits-from-card card))}
+             (get-in cdef [:abilities ability]))
+        cannot-play (or (:disabled card)
+                        (any-effects state side :prevent-ability true? card [ab ability]))]
+    (when-not cannot-play
+      (do-play-ability state side card ab ability targets))))
 
 (defn play-auto-pump
   "Use the 'match strength with ice' function of icebreakers."
@@ -406,26 +396,36 @@
         total-cost (merge-costs (conj total-pump-cost total-break-cost))]
     (when (can-pay? state side eid card (:title card) total-cost)
       (wait-for (pay-sync state side (make-eid state eid) card total-cost)
-                (dotimes [n times-pump]
+                (dotimes [n (or times-pump 0)]
                   (resolve-ability state side (dissoc pump-ability :cost :msg) (get-card state card) nil))
                 (doseq [sub (remove :broken (:subroutines current-ice))]
                   (break-subroutine! state (get-card state current-ice) sub card)
                   (resolve-ability state side (make-eid state {:source card :source-type :ability})
                                    (:additional-ability break-ability) (get-card state card) nil))
-                (system-msg state side (if (pos? times-pump)
-                                         (str (build-spend-msg async-result "increase")
-                                              "the strength of " (:title card)
-                                              " to " (get-strength (get-card state card))
-                                              " and break all " unbroken-subs
-                                              " subroutines on " (:title current-ice))
-                                         (str (build-spend-msg async-result "use")
-                                              (:title card)
-                                              " to break "
-                                              (if some-already-broken
-                                                "the remaining "
-                                                "all ")
-                                              unbroken-subs " subroutines on "
-                                              (:title current-ice))))))))
+                (let [ice (get-card state current-ice)
+                      cost-str async-result
+                      broken-subs (remove :broken (:subroutines current-ice))
+                      on-break-subs (when ice (:on-break-subs (card-def current-ice)))
+                      event-args (when on-break-subs
+                                   {:card-abilities (ability-as-handler ice on-break-subs)})]
+                  (wait-for
+                    (trigger-event-simult state side :subroutines-broken event-args ice broken-subs)
+                    (system-msg state side
+                                (if (pos? times-pump)
+                                  (str (build-spend-msg cost-str "increase")
+                                       "the strength of " (:title card)
+                                       " to " (get-strength (get-card state card))
+                                       " and break all " (when (< 1 unbroken-subs) unbroken-subs)
+                                       " subroutines on " (:title current-ice))
+                                  (str (build-spend-msg cost-str "use")
+                                       (:title card)
+                                       " to break "
+                                       (if some-already-broken
+                                         "the remaining "
+                                         "all ")
+                                       unbroken-subs " subroutines on "
+                                       (:title current-ice))))
+                    (continue state side nil)))))))
 
 (defn play-copy-ability
   "Play an ability from another card's definition."
@@ -435,7 +435,7 @@
         abi (when (< -1 index (count source-abis))
               (nth source-abis index))]
     (when abi
-      (do-play-ability state side card abi nil))))
+      (do-play-ability state side card abi index nil))))
 
 (def dynamic-abilities
   {"auto-pump" play-auto-pump
@@ -453,16 +453,22 @@
   [state side {:keys [card ability targets] :as args}]
   (let [card (get-card state card)
         cdef (card-def card)
-        ab (get-in cdef [:corp-abilities ability])]
-    (do-play-ability state side card ab targets)))
+        ab (get-in cdef [:corp-abilities ability])
+        cannot-play (or (:disabled card)
+                        (any-effects state side :prevent-ability true? card [ab ability]))]
+    (when-not cannot-play
+      (do-play-ability state side card ab ability targets))))
 
 (defn play-runner-ability
   "Triggers a corp card's runner-ability using its zero-based index into the card's card-def :runner-abilities vector."
   [state side {:keys [card ability targets] :as args}]
   (let [card (get-card state card)
         cdef (card-def card)
-        ab (get-in cdef [:runner-abilities ability])]
-    (do-play-ability state side card ab targets)))
+        ab (get-in cdef [:runner-abilities ability])
+        cannot-play (or (:disabled card)
+                        (any-effects state side :prevent-ability true? card [ab ability]))]
+    (when-not cannot-play
+      (do-play-ability state side card ab ability targets))))
 
 (defn play-subroutine
   "Triggers a card's subroutine using its zero-based index into the card's :subroutines vector."
@@ -483,29 +489,12 @@
 (defn trash-resource
   "Click to trash a resource."
   [state side args]
-  (let [trash-cost (max 0 (- 2 (get-in @state [:corp :trash-cost-bonus] 0)))]
-    (when-let [cost-str (pay state side nil :click 1 :credit trash-cost {:action :corp-trash-resource})]
-      (resolve-ability state side
-                       {:prompt  "Choose a resource to trash"
-                        :choices {:card (fn [card]
-                                          (if (and (seq (filter (fn [c] (untrashable-while-resources? c)) (all-active-installed state :runner)))
-                                                   (> (count (filter resource? (all-active-installed state :runner))) 1))
-                                            (and (resource? card) (not (untrashable-while-resources? card)))
-                                            (resource? card)))}
-                        :cancel-effect (effect (gain :credit trash-cost :click 1))
-                        :effect  (effect (trash target)
-                                         (system-msg (str (build-spend-msg cost-str "trash")
-                                                          (:title target))))} nil nil))))
+  (play-ability state side {:card (get-in @state [:corp :basic-action-card]) :ability 5}))
 
 (defn do-purge
   "Purge viruses."
   [state side args]
-  (when-let [cost (pay state side nil :click 3 {:action :corp-click-purge})]
-    (purge state side)
-    (let [spent (build-spend-msg cost "purge")
-          message (str spent "all virus counters")]
-      (system-msg state side message))
-    (play-sfx state side "virus-purge")))
+  (play-ability state side {:card (get-in @state [:corp :basic-action-card]) :ability 6}))
 
 (defn get-rez-cost
   [state side card {:keys [ignore-cost alternative-cost cost-bonus] :as args}]
@@ -586,7 +575,7 @@
                                  (play-sfx state side "rez-ice"))
                              (play-sfx state side "rez-other"))
                            (swap! state update-in [:stats :corp :cards :rezzed] (fnil inc 0))
-                           (trigger-event-sync state side eid :rez card))
+                           (trigger-event-sync state side eid :rez (get-card state card)))
                        (effect-completed state side eid)))))
        (effect-completed state side eid)))))
 
@@ -595,13 +584,21 @@
   [state side card]
   (let [card (get-card state card)]
     (system-msg state side (str "derezzes " (:title card)))
+    (unregister-events state side card)
     (update! state :corp (deactivate state :corp card true))
     (let [cdef (card-def card)]
       (when-let [derez-effect (:derez-effect cdef)]
         (resolve-ability state side derez-effect (get-card state card) nil))
-      (register-events state side card (map #(assoc % :condition :derezzed) (:derezzed-events cdef))))
+      (when-let [derezzed-events (:derezzed-events cdef)]
+        (register-events state side card (map #(assoc % :condition :derezzed) derezzed-events))))
     (unregister-constant-effects state side card)
     (trigger-event state side :derez card side)))
+
+(defn click-advance
+  "Click to advance installed card."
+  [state side {:keys [card]}]
+  (when-let [card (get-card state card)]
+    (play-ability state side {:card (get-in @state [:corp :basic-action-card]) :ability 4 :targets [card]})))
 
 (defn advance
   "Advance a corp card that can be advanced.
@@ -635,76 +632,36 @@
                                                             :init-data true})
                        points (get-agenda-points state :corp c)]
                    (system-msg state :corp (str "scores " (:title c) " and gains " (quantify points "agenda point")))
-                   (trigger-event-simult state :corp eid :agenda-scored
-                                         {:first-ability {:effect (req (when-let [current (first (get-in @state [:runner :current]))]
-                                                                         ;; This is to handle Employee Strike with damage IDs #2688
-                                                                         (when (:disable-id (card-def current))
-                                                                           (swap! state assoc-in [:corp :disable-id] true)))
-                                                                       (remove-old-current state side :runner))}
-                                          :card-abilities (card-as-handler c)
-                                          :after-active-player {:effect (req (let [c (get-card state c)
-                                                                                   points (or (get-agenda-points state :corp c) points)]
-                                                                               (set-prop state :corp (get-card state moved-card) :advance-counter 0)
-                                                                               (swap! state update-in [:corp :register :scored-agenda] #(+ (or % 0) points))
-                                                                               (swap! state dissoc-in [:corp :disable-id])
-                                                                               (gain-agenda-point state :corp points)
-                                                                               (play-sfx state side "agenda-score")))}}
-                    c)))))))
-
-(defn no-action
-  "The corp indicates they have no more actions for the encounter."
-  [state side args]
-  (swap! state assoc-in [:run :no-action] true)
-  (system-msg state side "has no further action")
-  (trigger-event state side :no-action)
-  (let [run-ice (get-run-ices state)
-        pos (get-in @state [:run :position])
-        ice (when (and pos (pos? pos) (<= pos (count run-ice)))
-              (get-card state (nth run-ice (dec pos))))]
-    (when (rezzed? ice)
-      (trigger-event state side :encounter-ice ice)
-      (update-ice-strength state side ice))))
+                   (trigger-event-simult
+                     state :corp eid :agenda-scored
+                     {:first-ability {:effect (req (when-let [current (first (get-in @state [:runner :current]))]
+                                                     ;; This is to handle Employee Strike with damage IDs #2688
+                                                     (when (:disable-id (card-def current))
+                                                       (swap! state assoc-in [:corp :disable-id] true)))
+                                                   (remove-old-current state side :runner))}
+                      :card-abilities (card-as-handler c)
+                      :after-active-player
+                      {:effect (req (let [c (get-card state c)
+                                          points (or (get-agenda-points state :corp c) points)]
+                                      (set-prop state :corp (get-card state moved-card) :advance-counter 0)
+                                      (swap! state update-in [:corp :register :scored-agenda] #(+ (or % 0) points))
+                                      (swap! state dissoc-in [:corp :disable-id])
+                                      (update-all-agenda-points state side)
+                                      (check-winner state side)
+                                      (play-sfx state side "agenda-score")))}}
+                     c)))))))
 
 ;;; Runner actions
 (defn click-run
   "Click to start a run."
   [state side {:keys [server] :as args}]
-  (make-run state side (make-eid state) server nil nil {:click-run true}))
+  (play-ability state side {:card (get-in @state [:runner :basic-action-card]) :ability 4 :targets [server]}))
 
 (defn remove-tag
   "Click to remove a tag."
   ([state side args] (remove-tag state side (make-eid state) args))
   ([state side eid args]
-  (let [remove-cost (max 0 (- 2 (get-in @state [:runner :tag-remove-bonus] 0)))]
-    (wait-for (pay-sync state side (make-eid state {:source :action :source-type :remove-tag}) nil :click 1 :credit remove-cost)
-              (when-let [cost-str async-result]
-                (lose-tags state :runner 1)
-                (system-msg state side (string/trimr (build-spend-msg cost-str "remove 1 tag" "removes 1 tag")))
-                (play-sfx state side "click-remove-tag"))
-              (effect-completed state side eid)))))
-
-(defn continue
-  "The runner decides to approach the next ice, or the server itself."
-  [state side args]
-  (when (get-in @state [:run :no-action])
-    (let [run-ice (get-run-ices state)
-          pos (get-in @state [:run :position])
-          cur-ice (when (and pos (pos? pos) (<= pos (count run-ice)))
-                    (get-card state (nth run-ice (dec pos))))
-          next-ice (when (and pos (< 1 pos) (<= (dec pos) (count run-ice)))
-                     (get-card state (nth run-ice (- pos 2))))]
-      (wait-for (trigger-event-sync state side :pass-ice cur-ice)
-                (unregister-floating-effects state side :end-of-encounter)
-                (unregister-floating-events state side :end-of-encounter)
-                (swap! state update-in [:run :position] (fnil dec 1))
-                (swap! state assoc-in [:run :no-action] false)
-                (system-msg state side "continues the run")
-                (when cur-ice
-                  (reset-all-subs! state (get-card state cur-ice)))
-                (update-all-ice state side)
-                (update-all-icebreakers state side)
-                (trigger-event-simult state side (make-eid state)
-                                      (if next-ice :approach-ice :approach-server) nil (when next-ice next-ice))))))
+   (play-ability state side {:card (get-in @state [:runner :basic-action-card]) :ability 5})))
 
 (defn view-deck
   "Allows the player to view their deck by making the cards in the deck public."
@@ -717,3 +674,14 @@
   [state side args]
   (system-msg state side "stops looking at their deck")
   (swap! state update-in [side] dissoc :view-deck))
+
+(defn generate-install-list
+  [state side {:keys [card] :as args}]
+  (let [card (get-card state card)]
+    (if card
+      (swap! state assoc-in [:corp :install-list] (installable-servers state card))
+      (swap! state dissoc-in [:corp :install-list]))))
+
+(defn generate-runnable-zones
+  [state side args]
+  (swap! state assoc-in [:runner :runnable-list] (zones->sorted-names (get-runnable-zones state))))
